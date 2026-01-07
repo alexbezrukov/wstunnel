@@ -1,0 +1,12 @@
+[package]
+name = "tls-socks-tunnel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.25"
+rustls = "0.22"
+rustls-pemfile = "2.0"
+webpki-roots = "0.26"
+anyhow = "1.0"
