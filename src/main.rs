@@ -1,7 +1,8 @@
 // Cargo.toml dependencies:
+// [dependencies]
 // tokio = { version = "1", features = ["full"] }
 // tokio-rustls = "0.25"
-// rustls = "0.22"
+// rustls = { version = "0.22", features = ["dangerous_configuration"] }
 // rustls-pemfile = "2.0"
 // anyhow = "1.0"
 
@@ -66,19 +67,29 @@ async fn handle_client(stream: TcpStream, acceptor: TlsAcceptor, socks_addr: &st
 
 // ============ CLIENT SIDE (локально в вашей стране) ============
 
-pub async fn run_client(bind_addr: &str, server_addr: &str) -> Result<()> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -> Result<()> {
+    let config = if skip_verify {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+            .with_no_client_auth()
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
 
     let connector = TlsConnector::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
 
     println!("[CLIENT] Local SOCKS proxy on {}", bind_addr);
     println!("[CLIENT] Tunneling to {}", server_addr);
+    if skip_verify {
+        println!("[WARNING] Certificate verification DISABLED!");
+    }
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -118,6 +129,49 @@ async fn handle_local(
 
 // ============ HELPER FUNCTIONS ============
 
+// Отключение проверки сертификата (для самоподписанных)
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
@@ -145,14 +199,17 @@ async fn main() -> Result<()> {
             "  Server: {} server <bind_addr> <socks_addr> <cert.pem> <key.pem>",
             args[0]
         );
-        eprintln!("  Client: {} client <bind_addr> <server_addr>", args[0]);
+        eprintln!(
+            "  Client: {} client <bind_addr> <server_addr> [--insecure]",
+            args[0]
+        );
         eprintln!("\nExample:");
         eprintln!(
             "  Server: {} server 0.0.0.0:8443 127.0.0.1:1080 cert.pem key.pem",
             args[0]
         );
         eprintln!(
-            "  Client: {} client 127.0.0.1:1080 server.example.com:8443",
+            "  Client: {} client 127.0.0.1:1080 server.example.com:8443 --insecure",
             args[0]
         );
         std::process::exit(1);
@@ -168,10 +225,11 @@ async fn main() -> Result<()> {
         }
         "client" => {
             if args.len() < 4 {
-                eprintln!("Client needs: <bind_addr> <server_addr>");
+                eprintln!("Client needs: <bind_addr> <server_addr> [--insecure]");
                 std::process::exit(1);
             }
-            run_client(&args[2], &args[3]).await?;
+            let skip_verify = args.get(4).map(|s| s == "--insecure").unwrap_or(false);
+            run_client(&args[2], &args[3], skip_verify).await?;
         }
         _ => {
             eprintln!("Unknown mode. Use 'server' or 'client'");
