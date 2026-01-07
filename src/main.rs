@@ -9,7 +9,6 @@
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -24,10 +23,13 @@ pub async fn run_server(
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("Invalid cert/key")?;
+
+    // Поддержка TLS 1.2 для лучшей совместимости
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
@@ -68,7 +70,7 @@ async fn handle_client(stream: TcpStream, acceptor: TlsAcceptor, socks_addr: &st
 // ============ CLIENT SIDE (локально в вашей стране) ============
 
 pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -> Result<()> {
-    let config = if skip_verify {
+    let mut config = if skip_verify {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
@@ -81,6 +83,9 @@ pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -
             .with_root_certificates(root_store)
             .with_no_client_auth()
     };
+
+    // Поддержка TLS 1.2 для лучшей совместимости
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     let connector = TlsConnector::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
@@ -166,7 +171,13 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         vec![
             rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
             rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
             rustls::SignatureScheme::ED25519,
         ]
     }
