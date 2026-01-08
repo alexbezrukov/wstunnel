@@ -5,16 +5,99 @@
 // rustls = { version = "0.22", features = ["dangerous_configuration"] }
 // rustls-pemfile = "2.0"
 // anyhow = "1.0"
+// socket2 = "0.5"
+// dashmap = "5.5"
 
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration};
+use tokio::sync::{RwLock, Semaphore};
+use tokio::time::{timeout, Duration, Instant};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-// ============ SERVER SIDE (на зарубежном сервере) ============
+const BUFFER_SIZE: usize = 64 * 1024; // 64KB буферы
+const MAX_CONCURRENT_CLIENTS: usize = 10000;
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
+// Статистика производительности
+#[derive(Default)]
+struct Stats {
+    active_connections: AtomicU64,
+    total_bytes_rx: AtomicU64,
+    total_bytes_tx: AtomicU64,
+    total_connections: AtomicU64,
+}
+
+impl Stats {
+    fn report(&self) {
+        println!(
+            "[STATS] Active: {}, Total: {}, RX: {} MB, TX: {} MB",
+            self.active_connections.load(Ordering::Relaxed),
+            self.total_connections.load(Ordering::Relaxed),
+            self.total_bytes_rx.load(Ordering::Relaxed) / 1_000_000,
+            self.total_bytes_tx.load(Ordering::Relaxed) / 1_000_000,
+        );
+    }
+}
+
+// Пул соединений для переиспользования
+struct ConnectionPool {
+    connections: DashMap<String, Vec<TcpStream>>,
+    max_idle: usize,
+}
+
+impl ConnectionPool {
+    fn new(max_idle: usize) -> Self {
+        Self {
+            connections: DashMap::new(),
+            max_idle,
+        }
+    }
+
+    async fn get_or_create(&self, addr: &str) -> Result<TcpStream> {
+        // Попытка получить из пула
+        if let Some(mut entry) = self.connections.get_mut(addr) {
+            if let Some(stream) = entry.pop() {
+                // Проверка, что соединение живо
+                if stream.peer_addr().is_ok() {
+                    return Ok(stream);
+                }
+            }
+        }
+
+        // Создаём новое соединение
+        let stream = create_optimized_socket(addr).await?;
+        Ok(stream)
+    }
+
+    fn return_connection(&self, addr: String, stream: TcpStream) {
+        let mut entry = self.connections.entry(addr).or_insert_with(Vec::new);
+        if entry.len() < self.max_idle {
+            entry.push(stream);
+        }
+    }
+}
+
+// ============ ОПТИМИЗИРОВАННЫЙ СОКЕТ ============
+
+async fn create_optimized_socket(addr: &str) -> Result<TcpStream> {
+    // Упрощённая версия - используем стандартное подключение Tokio
+    let stream = TcpStream::connect(addr).await?;
+
+    // Применяем оптимизации
+    stream.set_nodelay(true)?;
+
+    Ok(stream)
+}
+
+// ============ SERVER SIDE ============
 
 pub async fn run_server(
     bind_addr: &str,
@@ -27,54 +110,114 @@ pub async fn run_server(
 
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("Invalid cert/key")?;
+        .with_single_cert(certs, key)?;
 
-    // Поддержка TLS 1.2 для лучшей совместимости
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // TLS оптимизации
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.max_fragment_size = Some(16384); // 16KB фрагменты
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(1024);
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
-    let listener = TcpListener::bind(bind_addr).await?;
+    let listener = create_server_listener(bind_addr).await?;
 
-    println!("[SERVER] Listening on {}", bind_addr);
+    println!("[SERVER] High-performance mode on {}", bind_addr);
     println!("[SERVER] Forwarding to SOCKS at {}", socks_addr);
 
-    let semaphore = Arc::new(Semaphore::new(1000)); // максимум 1000 клиентов
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
+    let stats = Arc::new(Stats::default());
+    let pool = Arc::new(ConnectionPool::new(100));
+
+    // Статистика каждые 30 секунд
+    let stats_clone = stats.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            stats_clone.report();
+        }
+    });
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let socks = socks_addr.to_string();
         let semaphore = semaphore.clone();
+        let stats = stats.clone();
+        let pool = pool.clone();
 
         tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-            if let Err(e) = handle_client(stream, acceptor, &socks).await {
+            let _permit = match semaphore.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
+            stats.active_connections.fetch_add(1, Ordering::Relaxed);
+            stats.total_connections.fetch_add(1, Ordering::Relaxed);
+
+            if let Err(e) =
+                handle_client_optimized(stream, acceptor, &socks, stats.clone(), pool).await
+            {
                 eprintln!("[SERVER] Error: {}", e);
             }
+
+            stats.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
 
-async fn handle_client(stream: TcpStream, acceptor: TlsAcceptor, socks_addr: &str) -> Result<()> {
-    let mut tls_stream = timeout(Duration::from_secs(10), acceptor.accept(stream)).await??;
-    println!("[SERVER] TLS connection established");
+async fn create_server_listener(addr: &str) -> Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::SocketAddr;
 
-    let mut socks_stream =
-        timeout(Duration::from_secs(10), TcpStream::connect(socks_addr)).await??;
-    println!("[SERVER] Connected to SOCKS proxy");
+    let socket_addr: SocketAddr = addr.parse()?;
+    let domain = if socket_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
 
-    let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
-    let (mut socks_r, mut socks_w) = tokio::io::split(socks_stream);
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
 
-    let t1 = tokio::io::copy(&mut tls_r, &mut socks_w);
-    let t2 = tokio::io::copy(&mut socks_r, &mut tls_w);
+    #[cfg(unix)]
+    {
+        use socket2::SockRef;
+        let sock_ref = SockRef::from(&socket);
+        sock_ref.set_reuse_port(true)?;
+    }
 
-    timeout(Duration::from_secs(300), async { tokio::try_join!(t1, t2) }).await??;
-    Ok(())
+    socket.set_nonblocking(true)?;
+    socket.bind(&socket_addr.into())?;
+    socket.listen(4096)?; // Большая очередь
+
+    let std_listener: std::net::TcpListener = socket.into();
+    Ok(TcpListener::from_std(std_listener)?)
 }
 
-// ============ CLIENT SIDE (локально в вашей стране) ============
+async fn handle_client_optimized(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    socks_addr: &str,
+    stats: Arc<Stats>,
+    pool: Arc<ConnectionPool>,
+) -> Result<()> {
+    // TLS handshake с таймаутом
+    let tls_stream = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+        .await
+        .context("TLS handshake timeout")??;
+
+    // Получаем или создаём соединение к SOCKS
+    let socks_stream = timeout(HANDSHAKE_TIMEOUT, pool.get_or_create(socks_addr))
+        .await
+        .context("SOCKS connect timeout")??;
+
+    // Bidirectional копирование с оптимизацией
+    let result = bidirectional_copy_optimized(tls_stream, socks_stream, stats).await;
+
+    result
+}
+
+// ============ CLIENT SIDE ============
 
 pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -> Result<()> {
     let mut config = if skip_verify {
@@ -85,92 +228,219 @@ pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -
     } else {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
         rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth()
     };
 
-    // Поддержка TLS 1.2 для лучшей совместимости
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // TLS оптимизации
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.max_fragment_size = Some(16384);
+    config.resumption = rustls::client::Resumption::default();
 
     let connector = TlsConnector::from(Arc::new(config));
-    let listener = TcpListener::bind(bind_addr).await?;
+    let listener = create_server_listener(bind_addr).await?;
 
-    println!("[CLIENT] Local SOCKS proxy on {}", bind_addr);
+    println!("[CLIENT] High-performance local SOCKS on {}", bind_addr);
     println!("[CLIENT] Tunneling to {}", server_addr);
     if skip_verify {
         println!("[WARNING] Certificate verification DISABLED!");
     }
 
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
+    let stats = Arc::new(Stats::default());
+    let pool = Arc::new(ConnectionPool::new(50));
+
+    // Статистика
+    let stats_clone = stats.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            stats_clone.report();
+        }
+    });
+
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
         let connector = connector.clone();
         let server = server_addr.to_string();
+        let semaphore = semaphore.clone();
+        let stats = stats.clone();
+        let pool = pool.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_local(stream, connector, &server).await {
-                eprintln!("[CLIENT] Error from {}: {}", peer, e);
+            let _permit = match semaphore.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
+            stats.active_connections.fetch_add(1, Ordering::Relaxed);
+            stats.total_connections.fetch_add(1, Ordering::Relaxed);
+
+            if let Err(e) =
+                handle_local_optimized(stream, connector, &server, stats.clone(), pool).await
+            {
+                eprintln!("[CLIENT] Error: {}", e);
             }
+
+            stats.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
 
-async fn handle_local(
-    mut local_stream: TcpStream,
+async fn handle_local_optimized(
+    local_stream: TcpStream,
     connector: TlsConnector,
     server_addr: &str,
+    stats: Arc<Stats>,
+    pool: Arc<ConnectionPool>,
 ) -> Result<()> {
     let server_name = server_addr.split(':').next().unwrap();
-    let tcp_stream = TcpStream::connect(server_addr).await?;
+
+    // Получаем соединение из пула или создаём новое
+    let tcp_stream = timeout(HANDSHAKE_TIMEOUT, pool.get_or_create(server_addr))
+        .await
+        .context("Server connect timeout")??;
 
     let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())?;
-    let mut tls_stream = connector.connect(domain, tcp_stream).await?;
+    let tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(domain, tcp_stream))
+        .await
+        .context("TLS handshake timeout")??;
 
-    println!("[CLIENT] TLS tunnel established");
+    bidirectional_copy_optimized(local_stream, tls_stream, stats).await
+}
 
-    let (mut local_r, mut local_w) = tokio::io::split(local_stream);
-    let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
+// ============ ОПТИМИЗИРОВАННОЕ КОПИРОВАНИЕ ============
 
-    let t1 = tokio::io::copy(&mut local_r, &mut tls_w);
-    let t2 = tokio::io::copy(&mut tls_r, &mut local_w);
+async fn bidirectional_copy_optimized<A, B>(
+    mut stream_a: A,
+    mut stream_b: B,
+    stats: Arc<Stats>,
+) -> Result<()>
+where
+    A: AsyncReadExt + AsyncWriteExt + Unpin,
+    B: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let (mut a_read, mut a_write) = tokio::io::split(stream_a);
+    let (mut b_read, mut b_write) = tokio::io::split(stream_b);
 
-    timeout(Duration::from_secs(300), async { tokio::try_join!(t1, t2) }).await??;
-    Ok(())
+    let stats_clone = stats.clone();
+    let copy_a_to_b = async {
+        let mut buf = vec![0u8; BUFFER_SIZE];
+        let mut total = 0u64;
+        let mut last_activity = Instant::now();
+
+        loop {
+            // Чтение с keepalive проверкой
+            let read_timeout = tokio::time::sleep(KEEPALIVE_INTERVAL);
+            tokio::pin!(read_timeout);
+
+            tokio::select! {
+                result = a_read.read(&mut buf) => {
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            a_write.write_all(&buf[..n]).await?;
+                            total += n as u64;
+                            last_activity = Instant::now();
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                _ = &mut read_timeout => {
+                    if last_activity.elapsed() > IDLE_TIMEOUT {
+                        return Err(anyhow::anyhow!("Idle timeout"));
+                    }
+                }
+            }
+        }
+
+        stats_clone
+            .total_bytes_rx
+            .fetch_add(total, Ordering::Relaxed);
+        Ok::<_, anyhow::Error>(total)
+    };
+
+    let stats_clone = stats.clone();
+    let copy_b_to_a = async {
+        let mut buf = vec![0u8; BUFFER_SIZE];
+        let mut total = 0u64;
+        let mut last_activity = Instant::now();
+
+        loop {
+            let read_timeout = tokio::time::sleep(KEEPALIVE_INTERVAL);
+            tokio::pin!(read_timeout);
+
+            tokio::select! {
+                result = b_read.read(&mut buf) => {
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            b_write.write_all(&buf[..n]).await?;
+                            total += n as u64;
+                            last_activity = Instant::now();
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                _ = &mut read_timeout => {
+                    if last_activity.elapsed() > IDLE_TIMEOUT {
+                        return Err(anyhow::anyhow!("Idle timeout"));
+                    }
+                }
+            }
+        }
+
+        stats_clone
+            .total_bytes_tx
+            .fetch_add(total, Ordering::Relaxed);
+        Ok::<_, anyhow::Error>(total)
+    };
+
+    // Запускаем оба направления параллельно
+    let result = tokio::try_join!(copy_a_to_b, copy_b_to_a);
+
+    match result {
+        Ok((rx, tx)) => {
+            println!("[CONN] Closed: RX {} KB, TX {} KB", rx / 1024, tx / 1024);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ============ HELPER FUNCTIONS ============
 
-// Отключение проверки сертификата (для самоподписанных)
 #[derive(Debug)]
 struct NoCertVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
@@ -178,13 +448,8 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         vec![
             rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
             rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
             rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
             rustls::SignatureScheme::ED25519,
         ]
     }
@@ -200,7 +465,6 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
-
     let keys = rustls_pemfile::private_key(&mut reader)?.context("No private key found")?;
     Ok(keys)
 }
@@ -212,7 +476,8 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage:");
+        eprintln!("High-Performance TLS Tunnel");
+        eprintln!("\nUsage:");
         eprintln!(
             "  Server: {} server <bind_addr> <socks_addr> <cert.pem> <key.pem>",
             args[0]
@@ -227,7 +492,7 @@ async fn main() -> Result<()> {
             args[0]
         );
         eprintln!(
-            "  Client: {} client 127.0.0.1:1080 server.example.com:8443 --insecure",
+            "  Client: {} client 127.0.0.1:1080 server.example.com:8443",
             args[0]
         );
         std::process::exit(1);
