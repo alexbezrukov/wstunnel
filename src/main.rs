@@ -11,6 +11,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::time::{timeout, Duration};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // ============ SERVER SIDE (на зарубежном сервере) ============
@@ -56,10 +57,11 @@ pub async fn run_server(
 }
 
 async fn handle_client(stream: TcpStream, acceptor: TlsAcceptor, socks_addr: &str) -> Result<()> {
-    let mut tls_stream = acceptor.accept(stream).await?;
+    let mut tls_stream = timeout(Duration::from_secs(10), acceptor.accept(stream)).await??;
     println!("[SERVER] TLS connection established");
 
-    let mut socks_stream = TcpStream::connect(socks_addr).await?;
+    let mut socks_stream =
+        timeout(Duration::from_secs(10), TcpStream::connect(socks_addr)).await??;
     println!("[SERVER] Connected to SOCKS proxy");
 
     let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
@@ -68,7 +70,7 @@ async fn handle_client(stream: TcpStream, acceptor: TlsAcceptor, socks_addr: &st
     let t1 = tokio::io::copy(&mut tls_r, &mut socks_w);
     let t2 = tokio::io::copy(&mut socks_r, &mut tls_w);
 
-    tokio::try_join!(t1, t2)?;
+    timeout(Duration::from_secs(300), async { tokio::try_join!(t1, t2) }).await??;
     Ok(())
 }
 
@@ -133,7 +135,7 @@ async fn handle_local(
     let t1 = tokio::io::copy(&mut local_r, &mut tls_w);
     let t2 = tokio::io::copy(&mut tls_r, &mut local_w);
 
-    tokio::try_join!(t1, t2)?;
+    timeout(Duration::from_secs(300), async { tokio::try_join!(t1, t2) }).await??;
     Ok(())
 }
 
