@@ -15,13 +15,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration, Instant};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB буферы
 const MAX_CONCURRENT_CLIENTS: usize = 10000;
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -107,7 +106,7 @@ async fn create_optimized_socket(addr: &str) -> Result<TcpStream> {
 
     #[cfg(unix)]
     {
-        socket.set_reuse_port(true)?;
+        // socket.set_reuse_port(true)?;
         // Увеличиваем буферы
         socket.set_send_buffer_size(256 * 1024)?;
         socket.set_recv_buffer_size(256 * 1024)?;
