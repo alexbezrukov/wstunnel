@@ -274,7 +274,13 @@ where
                             last_activity = Instant::now();
                         }
                         Err(e) => {
-                            eprintln!("[COPY] Read error: {}", e);
+                            // Игнорируем нормальные закрытия соединений
+                            let err_str = e.to_string();
+                            if !err_str.contains("close_notify")
+                                && !err_str.contains("Connection reset")
+                                && !err_str.contains("Broken pipe") {
+                                eprintln!("[COPY] Read error: {}", e);
+                            }
                             break;
                         }
                     }
@@ -311,7 +317,13 @@ where
                             last_activity = Instant::now();
                         }
                         Err(e) => {
-                            eprintln!("[COPY] Read error: {}", e);
+                            // Игнорируем нормальные закрытия соединений
+                            let err_str = e.to_string();
+                            if !err_str.contains("close_notify")
+                                && !err_str.contains("Connection reset")
+                                && !err_str.contains("Broken pipe") {
+                                eprintln!("[COPY] Read error: {}", e);
+                            }
                             break;
                         }
                     }
