@@ -201,10 +201,10 @@ async fn create_server_listener(addr: &str) -> Result<TcpListener> {
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
 
-    #[cfg(unix)]
-    {
-        socket.set_reuse_port(true)?;
-    }
+    // #[cfg(unix)]
+    // {
+    //     socket.set_reuse_port(true)?;
+    // }
 
     socket.set_nonblocking(true)?;
     socket.bind(&socket_addr.into())?;
