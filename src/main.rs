@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // ============ SERVER SIDE (на зарубежном сервере) ============
@@ -37,14 +38,18 @@ pub async fn run_server(
     println!("[SERVER] Listening on {}", bind_addr);
     println!("[SERVER] Forwarding to SOCKS at {}", socks_addr);
 
+    let semaphore = Arc::new(Semaphore::new(1000)); // максимум 1000 клиентов
+
     loop {
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let socks = socks_addr.to_string();
+        let semaphore = semaphore.clone();
 
         tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
             if let Err(e) = handle_client(stream, acceptor, &socks).await {
-                eprintln!("[SERVER] Error from {}: {}", peer, e);
+                eprintln!("[SERVER] Error: {}", e);
             }
         });
     }
