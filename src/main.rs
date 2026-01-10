@@ -352,7 +352,7 @@ where
 
 // ============ ОПТИМИЗИРОВАННОЕ КОПИРОВАНИЕ ============
 
-async fn bidirectional_copy<A, B>(mut a: A, mut b: B, stats: Arc<Stats>) -> Result<()>
+async fn bidirectional_copy<A, B>(a: A, b: B, stats: Arc<Stats>) -> Result<()>
 where
     A: AsyncReadExt + AsyncWriteExt + Unpin,
     B: AsyncReadExt + AsyncWriteExt + Unpin,
