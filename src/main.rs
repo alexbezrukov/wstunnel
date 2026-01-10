@@ -5,9 +5,13 @@
 // rustls = { version = "0.22", features = ["dangerous_configuration"] }
 // rustls-pemfile = "2.0"
 // anyhow = "1.0"
+// sha2 = "0.10"
+// hex = "0.4"
+// rand = "0.8"
 
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,11 +21,16 @@ use tokio::time::{timeout, Duration, Instant};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // Настройки производительности
-const BUFFER_SIZE: usize = 64 * 1024; // 64KB буферы
+const BUFFER_SIZE: usize = 64 * 1024;
 const MAX_CONCURRENT: usize = 5000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const COPY_TIMEOUT: Duration = Duration::from_secs(600);
+
+// Протокол аутентификации
+const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V1";
+const AUTH_CHALLENGE_SIZE: usize = 32;
+const AUTH_RESPONSE_SIZE: usize = 32;
 
 // Статистика
 #[derive(Default)]
@@ -30,14 +39,16 @@ struct Stats {
     total: AtomicU64,
     bytes_rx: AtomicU64,
     bytes_tx: AtomicU64,
+    auth_failed: AtomicU64,
 }
 
 impl Stats {
     fn report(&self) {
         println!(
-            "[STATS] Active: {}, Total: {}, RX: {} MB, TX: {} MB",
+            "[STATS] Active: {}, Total: {}, Failed auth: {}, RX: {} MB, TX: {} MB",
             self.active.load(Ordering::Relaxed),
             self.total.load(Ordering::Relaxed),
+            self.auth_failed.load(Ordering::Relaxed),
             self.bytes_rx.load(Ordering::Relaxed) / 1_000_000,
             self.bytes_tx.load(Ordering::Relaxed) / 1_000_000,
         );
@@ -51,6 +62,7 @@ pub async fn run_server(
     socks_addr: &str,
     cert_path: &str,
     key_path: &str,
+    secret_key: &str,
 ) -> Result<()> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
@@ -60,25 +72,24 @@ pub async fn run_server(
         .with_single_cert(certs, key)
         .context("Invalid cert/key")?;
 
-    // TLS оптимизации
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config.max_fragment_size = Some(16384);
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
 
-    // TCP оптимизации на уровне listener
     let socket = socket2::SockRef::from(&listener);
     let _ = socket.set_recv_buffer_size(256 * 1024);
     let _ = socket.set_send_buffer_size(256 * 1024);
 
     println!("[SERVER] Listening on {}", bind_addr);
     println!("[SERVER] Forwarding to SOCKS at {}", socks_addr);
+    println!("[SERVER] Authentication: ENABLED");
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let stats = Arc::new(Stats::default());
+    let secret = Arc::new(secret_key.to_string());
 
-    // Периодический отчет
     let stats_clone = stats.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -90,14 +101,13 @@ pub async fn run_server(
 
     loop {
         let (stream, peer) = listener.accept().await?;
-
-        // TCP оптимизации на соединении
         let _ = stream.set_nodelay(true);
 
         let acceptor = acceptor.clone();
         let socks = socks_addr.to_string();
         let semaphore = semaphore.clone();
         let stats = stats.clone();
+        let secret = secret.clone();
 
         tokio::spawn(async move {
             let _permit = match semaphore.acquire().await {
@@ -108,9 +118,13 @@ pub async fn run_server(
             stats.active.fetch_add(1, Ordering::Relaxed);
             stats.total.fetch_add(1, Ordering::Relaxed);
 
-            if let Err(e) = handle_server_connection(stream, acceptor, &socks, stats.clone()).await
+            if let Err(e) =
+                handle_server_connection(stream, acceptor, &socks, &secret, stats.clone(), peer)
+                    .await
             {
-                eprintln!("[SERVER] Error from {}: {}", peer, e);
+                if !e.to_string().contains("Authentication failed") {
+                    eprintln!("[SERVER] Error from {}: {}", peer, e);
+                }
             }
 
             stats.active.fetch_sub(1, Ordering::Relaxed);
@@ -122,12 +136,25 @@ async fn handle_server_connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     socks_addr: &str,
+    secret_key: &str,
     stats: Arc<Stats>,
+    peer: std::net::SocketAddr,
 ) -> Result<()> {
-    // TLS handshake с таймаутом
-    let tls_stream = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+    let mut tls_stream = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
         .await
         .context("TLS handshake timeout")??;
+
+    // Аутентификация клиента
+    if !authenticate_client(&mut tls_stream, secret_key).await? {
+        stats.auth_failed.fetch_add(1, Ordering::Relaxed);
+        eprintln!("[SERVER] Authentication failed from {}", peer);
+
+        // Отправляем фейковый HTTP ответ
+        send_decoy_response(&mut tls_stream).await?;
+        return Err(anyhow::anyhow!("Authentication failed"));
+    }
+
+    println!("[SERVER] Client authenticated: {}", peer);
 
     // Подключение к SOCKS
     let socks_stream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(socks_addr))
@@ -136,13 +163,76 @@ async fn handle_server_connection(
 
     let _ = socks_stream.set_nodelay(true);
 
-    // Bidirectional копирование
     bidirectional_copy(tls_stream, socks_stream, stats).await
+}
+
+async fn authenticate_client<S>(stream: &mut S, secret_key: &str) -> Result<bool>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    // Генерируем challenge
+    let mut challenge = [0u8; AUTH_CHALLENGE_SIZE];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut challenge);
+
+    // Отправляем challenge
+    stream.write_all(&challenge).await?;
+
+    // Читаем response
+    let mut response = [0u8; AUTH_RESPONSE_SIZE];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut response))
+        .await
+        .context("Auth timeout")??;
+
+    // Проверяем response
+    let expected = compute_auth_response(&challenge, secret_key);
+    Ok(response == expected)
+}
+
+fn compute_auth_response(challenge: &[u8], secret: &str) -> [u8; AUTH_RESPONSE_SIZE] {
+    let mut hasher = Sha256::new();
+    hasher.update(AUTH_MAGIC);
+    hasher.update(challenge);
+    hasher.update(secret.as_bytes());
+    let result = hasher.finalize();
+
+    let mut output = [0u8; AUTH_RESPONSE_SIZE];
+    output.copy_from_slice(&result[..AUTH_RESPONSE_SIZE]);
+    output
+}
+
+async fn send_decoy_response<S>(stream: &mut S) -> Result<()>
+where
+    S: AsyncWriteExt + Unpin,
+{
+    // Фейковый HTTP 404 ответ
+    let response = b"HTTP/1.1 404 Not Found\r\n\
+        Server: nginx/1.18.0\r\n\
+        Date: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
+        Content-Type: text/html\r\n\
+        Content-Length: 146\r\n\
+        Connection: close\r\n\
+        \r\n\
+        <html>\r\n\
+        <head><title>404 Not Found</title></head>\r\n\
+        <body>\r\n\
+        <center><h1>404 Not Found</h1></center>\r\n\
+        <hr><center>nginx/1.18.0</center>\r\n\
+        </body>\r\n\
+        </html>\r\n";
+
+    let _ = stream.write_all(response).await;
+    Ok(())
 }
 
 // ============ CLIENT SIDE ============
 
-pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -> Result<()> {
+pub async fn run_client(
+    bind_addr: &str,
+    server_addr: &str,
+    secret_key: &str,
+    skip_verify: bool,
+) -> Result<()> {
     let mut config = if skip_verify {
         rustls::ClientConfig::builder()
             .dangerous()
@@ -156,7 +246,6 @@ pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -
             .with_no_client_auth()
     };
 
-    // TLS оптимизации
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config.max_fragment_size = Some(16384);
     config.resumption = rustls::client::Resumption::default();
@@ -164,21 +253,21 @@ pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -
     let connector = TlsConnector::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
 
-    // TCP оптимизации
     let socket = socket2::SockRef::from(&listener);
     let _ = socket.set_recv_buffer_size(256 * 1024);
     let _ = socket.set_send_buffer_size(256 * 1024);
 
     println!("[CLIENT] Local SOCKS proxy on {}", bind_addr);
     println!("[CLIENT] Tunneling to {}", server_addr);
+    println!("[CLIENT] Authentication: ENABLED");
     if skip_verify {
         println!("[WARNING] Certificate verification DISABLED!");
     }
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let stats = Arc::new(Stats::default());
+    let secret = Arc::new(secret_key.to_string());
 
-    // Периодический отчет
     let stats_clone = stats.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -190,14 +279,13 @@ pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -
 
     loop {
         let (stream, peer) = listener.accept().await?;
-
-        // TCP оптимизации
         let _ = stream.set_nodelay(true);
 
         let connector = connector.clone();
         let server = server_addr.to_string();
         let semaphore = semaphore.clone();
         let stats = stats.clone();
+        let secret = secret.clone();
 
         tokio::spawn(async move {
             let _permit = match semaphore.acquire().await {
@@ -209,7 +297,7 @@ pub async fn run_client(bind_addr: &str, server_addr: &str, skip_verify: bool) -
             stats.total.fetch_add(1, Ordering::Relaxed);
 
             if let Err(e) =
-                handle_client_connection(stream, connector, &server, stats.clone()).await
+                handle_client_connection(stream, connector, &server, &secret, stats.clone()).await
             {
                 eprintln!("[CLIENT] Error from {}: {}", peer, e);
             }
@@ -223,25 +311,43 @@ async fn handle_client_connection(
     local_stream: TcpStream,
     connector: TlsConnector,
     server_addr: &str,
+    secret_key: &str,
     stats: Arc<Stats>,
 ) -> Result<()> {
     let server_name = server_addr.split(':').next().unwrap();
 
-    // Подключение к серверу
     let tcp_stream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(server_addr))
         .await
         .context("Server connect timeout")??;
 
     let _ = tcp_stream.set_nodelay(true);
 
-    // TLS handshake
     let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())?;
-    let tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(domain, tcp_stream))
+    let mut tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(domain, tcp_stream))
         .await
         .context("TLS handshake timeout")??;
 
-    // Bidirectional копирование
+    // Аутентификация на сервере
+    authenticate_with_server(&mut tls_stream, secret_key).await?;
+
     bidirectional_copy(local_stream, tls_stream, stats).await
+}
+
+async fn authenticate_with_server<S>(stream: &mut S, secret_key: &str) -> Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    // Читаем challenge от сервера
+    let mut challenge = [0u8; AUTH_CHALLENGE_SIZE];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut challenge))
+        .await
+        .context("Auth challenge timeout")??;
+
+    // Вычисляем и отправляем response
+    let response = compute_auth_response(&challenge, secret_key);
+    stream.write_all(&response).await?;
+
+    Ok(())
 }
 
 // ============ ОПТИМИЗИРОВАННОЕ КОПИРОВАНИЕ ============
@@ -274,7 +380,6 @@ where
                             last_activity = Instant::now();
                         }
                         Err(e) => {
-                            // Игнорируем нормальные закрытия соединений
                             let err_str = e.to_string();
                             if !err_str.contains("close_notify")
                                 && !err_str.contains("Connection reset")
@@ -317,7 +422,6 @@ where
                             last_activity = Instant::now();
                         }
                         Err(e) => {
-                            // Игнорируем нормальные закрытия соединений
                             let err_str = e.to_string();
                             if !err_str.contains("close_notify")
                                 && !err_str.contains("Connection reset")
@@ -340,7 +444,6 @@ where
         total
     };
 
-    // Запускаем оба направления с общим таймаутом
     let result = timeout(COPY_TIMEOUT, async {
         let (rx, tx) = tokio::join!(copy_a_to_b, copy_b_to_a);
         (rx, tx)
@@ -427,43 +530,46 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Optimized TLS Tunnel");
+        eprintln!("Optimized TLS Tunnel with Authentication");
         eprintln!("\nUsage:");
         eprintln!(
-            "  Server: {} server <bind_addr> <socks_addr> <cert.pem> <key.pem>",
+            "  Server: {} server <bind_addr> <socks_addr> <cert.pem> <key.pem> <secret_key>",
             args[0]
         );
         eprintln!(
-            "  Client: {} client <bind_addr> <server_addr> [--insecure]",
+            "  Client: {} client <bind_addr> <server_addr> <secret_key> [--insecure]",
             args[0]
         );
         eprintln!("\nExample:");
         eprintln!(
-            "  Server: {} server 0.0.0.0:8443 127.0.0.1:1080 cert.pem key.pem",
+            "  Server: {} server 0.0.0.0:8443 127.0.0.1:1080 cert.pem key.pem MySecretKey123",
             args[0]
         );
         eprintln!(
-            "  Client: {} client 127.0.0.1:1080 server.example.com:8443",
+            "  Client: {} client 127.0.0.1:1080 server.example.com:8443 MySecretKey123",
             args[0]
         );
+        eprintln!("\nNote: Use the same secret_key on both server and client!");
         std::process::exit(1);
     }
 
     match args[1].as_str() {
         "server" => {
-            if args.len() < 6 {
-                eprintln!("Server needs: <bind_addr> <socks_addr> <cert.pem> <key.pem>");
+            if args.len() < 7 {
+                eprintln!(
+                    "Server needs: <bind_addr> <socks_addr> <cert.pem> <key.pem> <secret_key>"
+                );
                 std::process::exit(1);
             }
-            run_server(&args[2], &args[3], &args[4], &args[5]).await?;
+            run_server(&args[2], &args[3], &args[4], &args[5], &args[6]).await?;
         }
         "client" => {
-            if args.len() < 4 {
-                eprintln!("Client needs: <bind_addr> <server_addr> [--insecure]");
+            if args.len() < 5 {
+                eprintln!("Client needs: <bind_addr> <server_addr> <secret_key> [--insecure]");
                 std::process::exit(1);
             }
-            let skip_verify = args.get(4).map(|s| s == "--insecure").unwrap_or(false);
-            run_client(&args[2], &args[3], skip_verify).await?;
+            let skip_verify = args.get(5).map(|s| s == "--insecure").unwrap_or(false);
+            run_client(&args[2], &args[3], &args[4], skip_verify).await?;
         }
         _ => {
             eprintln!("Unknown mode. Use 'server' or 'client'");
