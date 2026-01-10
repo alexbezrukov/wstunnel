@@ -175,8 +175,9 @@ where
     use rand::RngCore;
     rand::thread_rng().fill_bytes(&mut challenge);
 
-    // Отправляем challenge
+    // Отправляем challenge и flush
     stream.write_all(&challenge).await?;
+    stream.flush().await?;
 
     // Читаем response
     let mut response = [0u8; AUTH_RESPONSE_SIZE];
@@ -339,20 +340,21 @@ where
 {
     // Читаем challenge от сервера
     let mut challenge = [0u8; AUTH_CHALLENGE_SIZE];
-    timeout(Duration::from_secs(5), stream.read_exact(&mut challenge))
+    timeout(Duration::from_secs(10), stream.read_exact(&mut challenge))
         .await
         .context("Auth challenge timeout")??;
 
     // Вычисляем и отправляем response
     let response = compute_auth_response(&challenge, secret_key);
     stream.write_all(&response).await?;
+    stream.flush().await?;
 
     Ok(())
 }
 
 // ============ ОПТИМИЗИРОВАННОЕ КОПИРОВАНИЕ ============
 
-async fn bidirectional_copy<A, B>(a: A, b: B, stats: Arc<Stats>) -> Result<()>
+async fn bidirectional_copy<A, B>(mut a: A, mut b: B, stats: Arc<Stats>) -> Result<()>
 where
     A: AsyncReadExt + AsyncWriteExt + Unpin,
     B: AsyncReadExt + AsyncWriteExt + Unpin,
