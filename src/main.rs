@@ -1,14 +1,3 @@
-// Cargo.toml dependencies:
-// [dependencies]
-// tokio = { version = "1", features = ["full"] }
-// tokio-rustls = "0.25"
-// rustls = { version = "0.22", features = ["dangerous_configuration"] }
-// rustls-pemfile = "2.0"
-// anyhow = "1.0"
-// sha2 = "0.10"
-// hex = "0.4"
-// rand = "0.8"
-
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
@@ -22,7 +11,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // Настройки производительности
 const BUFFER_SIZE: usize = 64 * 1024;
-const MAX_CONCURRENT: usize = 5000;
+const MAX_CONCURRENT: usize = 10000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const COPY_TIMEOUT: Duration = Duration::from_secs(600);
@@ -354,7 +343,7 @@ where
 
 // ============ ОПТИМИЗИРОВАННОЕ КОПИРОВАНИЕ ============
 
-async fn bidirectional_copy<A, B>(mut a: A, mut b: B, stats: Arc<Stats>) -> Result<()>
+async fn bidirectional_copy<A, B>(a: A, b: B, stats: Arc<Stats>) -> Result<()>
 where
     A: AsyncReadExt + AsyncWriteExt + Unpin,
     B: AsyncReadExt + AsyncWriteExt + Unpin,
