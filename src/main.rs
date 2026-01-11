@@ -6,15 +6,15 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{timeout, Duration};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-// Настройки производительности
-const BUFFER_SIZE: usize = 256 * 1024;
+// Оптимизированные настройки производительности
+const BUFFER_SIZE: usize = 1024 * 1024; // 1MB буфер для высокой пропускной способности
 const MAX_CONCURRENT: usize = 10000;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const COPY_TIMEOUT: Duration = Duration::from_secs(600);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+const READ_TIMEOUT: Duration = Duration::from_secs(300); // Увеличен для медленных соединений
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Протокол аутентификации
 const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V1";
@@ -67,13 +67,15 @@ pub async fn run_server(
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
 
+    // Увеличенные буферы сокетов
     let socket = socket2::SockRef::from(&listener);
-    let _ = socket.set_recv_buffer_size(256 * 1024);
-    let _ = socket.set_send_buffer_size(256 * 1024);
+    let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB
+    let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB
 
     println!("[SERVER] Listening on {}", bind_addr);
     println!("[SERVER] Forwarding to SOCKS at {}", socks_addr);
     println!("[SERVER] Authentication: ENABLED");
+    println!("[SERVER] Buffer size: {} KB", BUFFER_SIZE / 1024);
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let stats = Arc::new(Stats::default());
@@ -90,7 +92,17 @@ pub async fn run_server(
 
     loop {
         let (stream, peer) = listener.accept().await?;
+
+        // Критически важно: TCP_NODELAY для минимальной задержки
         let _ = stream.set_nodelay(true);
+
+        // Увеличенные буферы для каждого соединения
+        if let Ok(socket) = socket2::SockRef::from(&stream).set_recv_buffer_size(1024 * 1024) {
+            let _ = socket;
+        }
+        if let Ok(socket) = socket2::SockRef::from(&stream).set_send_buffer_size(1024 * 1024) {
+            let _ = socket;
+        }
 
         let acceptor = acceptor.clone();
         let socks = socks_addr.to_string();
@@ -137,8 +149,6 @@ async fn handle_server_connection(
     if !authenticate_client(&mut tls_stream, secret_key).await? {
         stats.auth_failed.fetch_add(1, Ordering::Relaxed);
         eprintln!("[SERVER] Authentication failed from {}", peer);
-
-        // Отправляем фейковый HTTP ответ
         send_decoy_response(&mut tls_stream).await?;
         return Err(anyhow::anyhow!("Authentication failed"));
     }
@@ -152,6 +162,14 @@ async fn handle_server_connection(
 
     let _ = socks_stream.set_nodelay(true);
 
+    // Увеличенные буферы для SOCKS соединения
+    if let Ok(socket) = socket2::SockRef::from(&socks_stream).set_recv_buffer_size(1024 * 1024) {
+        let _ = socket;
+    }
+    if let Ok(socket) = socket2::SockRef::from(&socks_stream).set_send_buffer_size(1024 * 1024) {
+        let _ = socket;
+    }
+
     bidirectional_copy(tls_stream, socks_stream, stats).await
 }
 
@@ -159,22 +177,18 @@ async fn authenticate_client<S>(stream: &mut S, secret_key: &str) -> Result<bool
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // Генерируем challenge
     let mut challenge = [0u8; AUTH_CHALLENGE_SIZE];
     use rand::RngCore;
     rand::thread_rng().fill_bytes(&mut challenge);
 
-    // Отправляем challenge и flush
     stream.write_all(&challenge).await?;
     stream.flush().await?;
 
-    // Читаем response
     let mut response = [0u8; AUTH_RESPONSE_SIZE];
-    timeout(Duration::from_secs(5), stream.read_exact(&mut response))
+    timeout(AUTH_TIMEOUT, stream.read_exact(&mut response))
         .await
         .context("Auth timeout")??;
 
-    // Проверяем response
     let expected = compute_auth_response(&challenge, secret_key);
     Ok(response == expected)
 }
@@ -195,7 +209,6 @@ async fn send_decoy_response<S>(stream: &mut S) -> Result<()>
 where
     S: AsyncWriteExt + Unpin,
 {
-    // Фейковый HTTP 404 ответ
     let response = b"HTTP/1.1 404 Not Found\r\n\
         Server: nginx/1.18.0\r\n\
         Date: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
@@ -243,13 +256,15 @@ pub async fn run_client(
     let connector = TlsConnector::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
 
+    // Увеличенные буферы сокетов
     let socket = socket2::SockRef::from(&listener);
-    let _ = socket.set_recv_buffer_size(256 * 1024);
-    let _ = socket.set_send_buffer_size(256 * 1024);
+    let _ = socket.set_recv_buffer_size(2 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(2 * 1024 * 1024);
 
     println!("[CLIENT] Local SOCKS proxy on {}", bind_addr);
     println!("[CLIENT] Tunneling to {}", server_addr);
     println!("[CLIENT] Authentication: ENABLED");
+    println!("[CLIENT] Buffer size: {} KB", BUFFER_SIZE / 1024);
     if skip_verify {
         println!("[WARNING] Certificate verification DISABLED!");
     }
@@ -270,6 +285,14 @@ pub async fn run_client(
     loop {
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
+
+        // Увеличенные буферы
+        if let Ok(socket) = socket2::SockRef::from(&stream).set_recv_buffer_size(1024 * 1024) {
+            let _ = socket;
+        }
+        if let Ok(socket) = socket2::SockRef::from(&stream).set_send_buffer_size(1024 * 1024) {
+            let _ = socket;
+        }
 
         let connector = connector.clone();
         let server = server_addr.to_string();
@@ -312,12 +335,19 @@ async fn handle_client_connection(
 
     let _ = tcp_stream.set_nodelay(true);
 
+    // Увеличенные буферы для серверного соединения
+    if let Ok(socket) = socket2::SockRef::from(&tcp_stream).set_recv_buffer_size(1024 * 1024) {
+        let _ = socket;
+    }
+    if let Ok(socket) = socket2::SockRef::from(&tcp_stream).set_send_buffer_size(1024 * 1024) {
+        let _ = socket;
+    }
+
     let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())?;
     let mut tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(domain, tcp_stream))
         .await
         .context("TLS handshake timeout")??;
 
-    // Аутентификация на сервере
     authenticate_with_server(&mut tls_stream, secret_key).await?;
 
     bidirectional_copy(local_stream, tls_stream, stats).await
@@ -327,13 +357,11 @@ async fn authenticate_with_server<S>(stream: &mut S, secret_key: &str) -> Result
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // Читаем challenge от сервера
     let mut challenge = [0u8; AUTH_CHALLENGE_SIZE];
-    timeout(Duration::from_secs(10), stream.read_exact(&mut challenge))
+    timeout(AUTH_TIMEOUT, stream.read_exact(&mut challenge))
         .await
         .context("Auth challenge timeout")??;
 
-    // Вычисляем и отправляем response
     let response = compute_auth_response(&challenge, secret_key);
     stream.write_all(&response).await?;
     stream.flush().await?;
@@ -341,7 +369,7 @@ where
     Ok(())
 }
 
-// ============ ОПТИМИЗИРОВАННОЕ КОПИРОВАНИЕ ============
+// ============ МАКСИМАЛЬНО ОПТИМИЗИРОВАННОЕ КОПИРОВАНИЕ ============
 
 async fn bidirectional_copy<A, B>(a: A, b: B, stats: Arc<Stats>) -> Result<()>
 where
@@ -355,40 +383,28 @@ where
     let copy_a_to_b = async move {
         let mut buf = vec![0u8; BUFFER_SIZE];
         let mut total = 0u64;
-        let mut last_activity = Instant::now();
 
         loop {
-            tokio::select! {
-                result = a_read.read(&mut buf) => {
-                    match result {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if let Err(e) = b_write.write_all(&buf[..n]).await {
-                                eprintln!("[COPY] Write error: {}", e);
-                                break;
-                            }
+            match tokio::time::timeout(READ_TIMEOUT, a_read.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    match b_write.write_all(&buf[..n]).await {
+                        Ok(_) => {
                             total += n as u64;
-                            last_activity = Instant::now();
-                        }
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            if !err_str.contains("close_notify")
-                                && !err_str.contains("Connection reset")
-                                && !err_str.contains("Broken pipe") {
-                                eprintln!("[COPY] Read error: {}", e);
+                            // Периодический flush для баланса задержки и пропускной способности
+                            if total % (BUFFER_SIZE as u64 * 4) == 0 {
+                                let _ = b_write.flush().await;
                             }
-                            break;
                         }
+                        Err(_) => break,
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    if last_activity.elapsed() > IDLE_TIMEOUT {
-                        break;
-                    }
-                }
+                Ok(Err(_)) => break,
+                Err(_) => break, // Timeout
             }
         }
 
+        let _ = b_write.flush().await;
         stats_ab.bytes_rx.fetch_add(total, Ordering::Relaxed);
         total
     };
@@ -397,62 +413,39 @@ where
     let copy_b_to_a = async move {
         let mut buf = vec![0u8; BUFFER_SIZE];
         let mut total = 0u64;
-        let mut last_activity = Instant::now();
 
         loop {
-            tokio::select! {
-                result = b_read.read(&mut buf) => {
-                    match result {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if let Err(e) = a_write.write_all(&buf[..n]).await {
-                                eprintln!("[COPY] Write error: {}", e);
-                                break;
-                            }
+            match tokio::time::timeout(READ_TIMEOUT, b_read.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    match a_write.write_all(&buf[..n]).await {
+                        Ok(_) => {
                             total += n as u64;
-                            last_activity = Instant::now();
-                        }
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            if !err_str.contains("close_notify")
-                                && !err_str.contains("Connection reset")
-                                && !err_str.contains("Broken pipe") {
-                                eprintln!("[COPY] Read error: {}", e);
+                            // Периодический flush
+                            if total % (BUFFER_SIZE as u64 * 4) == 0 {
+                                let _ = a_write.flush().await;
                             }
-                            break;
                         }
+                        Err(_) => break,
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    if last_activity.elapsed() > IDLE_TIMEOUT {
-                        break;
-                    }
-                }
+                Ok(Err(_)) => break,
+                Err(_) => break, // Timeout
             }
         }
 
+        let _ = a_write.flush().await;
         stats_ba.bytes_tx.fetch_add(total, Ordering::Relaxed);
         total
     };
 
-    let result = timeout(COPY_TIMEOUT, async {
-        let (rx, tx) = tokio::join!(copy_a_to_b, copy_b_to_a);
-        (rx, tx)
-    })
-    .await;
+    let (rx, tx) = tokio::join!(copy_a_to_b, copy_b_to_a);
 
-    match result {
-        Ok((rx, tx)) => {
-            if rx > 0 || tx > 0 {
-                println!("[CONN] Closed: RX {} KB, TX {} KB", rx / 1024, tx / 1024);
-            }
-            Ok(())
-        }
-        Err(_) => {
-            eprintln!("[CONN] Connection timeout");
-            Ok(())
-        }
+    if rx > 0 || tx > 0 {
+        println!("[CONN] Closed: RX {} KB, TX {} KB", rx / 1024, tx / 1024);
     }
+
+    Ok(())
 }
 
 // ============ HELPER FUNCTIONS ============
@@ -521,7 +514,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Optimized TLS Tunnel with Authentication");
+        eprintln!("High-Performance TLS Tunnel with Authentication");
         eprintln!("\nUsage:");
         eprintln!(
             "  Server: {} server <bind_addr> <socks_addr> <cert.pem> <key.pem> <secret_key>",
@@ -540,7 +533,6 @@ async fn main() -> Result<()> {
             "  Client: {} client 127.0.0.1:1080 server.example.com:8443 MySecretKey123",
             args[0]
         );
-        eprintln!("\nNote: Use the same secret_key on both server and client!");
         std::process::exit(1);
     }
 
