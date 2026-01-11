@@ -10,7 +10,7 @@ use tokio::time::{timeout, Duration, Instant};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // Настройки производительности
-const BUFFER_SIZE: usize = 64 * 1024;
+const BUFFER_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT: usize = 10000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
