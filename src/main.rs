@@ -9,19 +9,17 @@ use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-// Оптимизированные настройки производительности
-const BUFFER_SIZE: usize = 1024 * 1024; // 1MB буфер для высокой пропускной способности
+// ИСПРАВЛЕНО: Уменьшенные буферы для экономии памяти
+const BUFFER_SIZE: usize = 64 * 1024; // 64KB вместо 1MB
 const MAX_CONCURRENT: usize = 10000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-const READ_TIMEOUT: Duration = Duration::from_secs(300); // Увеличен для медленных соединений
+const READ_TIMEOUT: Duration = Duration::from_secs(300);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Протокол аутентификации
 const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V1";
 const AUTH_CHALLENGE_SIZE: usize = 32;
 const AUTH_RESPONSE_SIZE: usize = 32;
 
-// Статистика
 #[derive(Default)]
 struct Stats {
     active: AtomicU64,
@@ -33,13 +31,15 @@ struct Stats {
 
 impl Stats {
     fn report(&self) {
+        let active = self.active.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        let rx_mb = self.bytes_rx.load(Ordering::Relaxed) / 1_000_000;
+        let tx_mb = self.bytes_tx.load(Ordering::Relaxed) / 1_000_000;
+        let failed = self.auth_failed.load(Ordering::Relaxed);
+
         println!(
-            "[STATS] Active: {}, Total: {}, Failed auth: {}, RX: {} MB, TX: {} MB",
-            self.active.load(Ordering::Relaxed),
-            self.total.load(Ordering::Relaxed),
-            self.auth_failed.load(Ordering::Relaxed),
-            self.bytes_rx.load(Ordering::Relaxed) / 1_000_000,
-            self.bytes_tx.load(Ordering::Relaxed) / 1_000_000,
+            "[STATS] Active: {}, Total: {}, Failed: {}, RX: {} MB, TX: {} MB",
+            active, total, failed, rx_mb, tx_mb
         );
     }
 }
@@ -67,15 +67,16 @@ pub async fn run_server(
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
 
-    // Увеличенные буферы сокетов
     let socket = socket2::SockRef::from(&listener);
-    let _ = socket.set_recv_buffer_size(2 * 1024 * 1024); // 2MB
-    let _ = socket.set_send_buffer_size(2 * 1024 * 1024); // 2MB
+    let _ = socket.set_recv_buffer_size(512 * 1024);
+    let _ = socket.set_send_buffer_size(512 * 1024);
 
     println!("[SERVER] Listening on {}", bind_addr);
     println!("[SERVER] Forwarding to SOCKS at {}", socks_addr);
-    println!("[SERVER] Authentication: ENABLED");
-    println!("[SERVER] Buffer size: {} KB", BUFFER_SIZE / 1024);
+    println!(
+        "[SERVER] Buffer size: {} KB (per direction)",
+        BUFFER_SIZE / 1024
+    );
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let stats = Arc::new(Stats::default());
@@ -92,15 +93,13 @@ pub async fn run_server(
 
     loop {
         let (stream, peer) = listener.accept().await?;
-
-        // Критически важно: TCP_NODELAY для минимальной задержки
         let _ = stream.set_nodelay(true);
 
-        // Увеличенные буферы для каждого соединения
-        if let Ok(socket) = socket2::SockRef::from(&stream).set_recv_buffer_size(1024 * 1024) {
+        // ИСПРАВЛЕНО: Умеренные буферы
+        if let Ok(socket) = socket2::SockRef::from(&stream).set_recv_buffer_size(256 * 1024) {
             let _ = socket;
         }
-        if let Ok(socket) = socket2::SockRef::from(&stream).set_send_buffer_size(1024 * 1024) {
+        if let Ok(socket) = socket2::SockRef::from(&stream).set_send_buffer_size(256 * 1024) {
             let _ = socket;
         }
 
@@ -111,7 +110,8 @@ pub async fn run_server(
         let secret = secret.clone();
 
         tokio::spawn(async move {
-            let _permit = match semaphore.acquire().await {
+            // ИСПРАВЛЕНО: Правильная обработка permit
+            let permit = match semaphore.acquire().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
@@ -119,16 +119,18 @@ pub async fn run_server(
             stats.active.fetch_add(1, Ordering::Relaxed);
             stats.total.fetch_add(1, Ordering::Relaxed);
 
-            if let Err(e) =
+            let result =
                 handle_server_connection(stream, acceptor, &socks, &secret, stats.clone(), peer)
-                    .await
-            {
+                    .await;
+
+            if let Err(e) = result {
                 if !e.to_string().contains("Authentication failed") {
                     eprintln!("[SERVER] Error from {}: {}", peer, e);
                 }
             }
 
             stats.active.fetch_sub(1, Ordering::Relaxed);
+            drop(permit); // ИСПРАВЛЕНО: Явно освобождаем permit
         });
     }
 }
@@ -145,28 +147,25 @@ async fn handle_server_connection(
         .await
         .context("TLS handshake timeout")??;
 
-    // Аутентификация клиента
     if !authenticate_client(&mut tls_stream, secret_key).await? {
         stats.auth_failed.fetch_add(1, Ordering::Relaxed);
-        eprintln!("[SERVER] Authentication failed from {}", peer);
+        eprintln!("[SERVER] Auth failed: {}", peer);
         send_decoy_response(&mut tls_stream).await?;
         return Err(anyhow::anyhow!("Authentication failed"));
     }
 
-    println!("[SERVER] Client authenticated: {}", peer);
+    println!("[SERVER] Authenticated: {}", peer);
 
-    // Подключение к SOCKS
     let socks_stream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(socks_addr))
         .await
         .context("SOCKS connect timeout")??;
 
     let _ = socks_stream.set_nodelay(true);
 
-    // Увеличенные буферы для SOCKS соединения
-    if let Ok(socket) = socket2::SockRef::from(&socks_stream).set_recv_buffer_size(1024 * 1024) {
+    if let Ok(socket) = socket2::SockRef::from(&socks_stream).set_recv_buffer_size(256 * 1024) {
         let _ = socket;
     }
-    if let Ok(socket) = socket2::SockRef::from(&socks_stream).set_send_buffer_size(1024 * 1024) {
+    if let Ok(socket) = socket2::SockRef::from(&socks_stream).set_send_buffer_size(256 * 1024) {
         let _ = socket;
     }
 
@@ -211,18 +210,11 @@ where
 {
     let response = b"HTTP/1.1 404 Not Found\r\n\
         Server: nginx/1.18.0\r\n\
-        Date: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
-        Content-Type: text/html\r\n\
         Content-Length: 146\r\n\
         Connection: close\r\n\
         \r\n\
-        <html>\r\n\
-        <head><title>404 Not Found</title></head>\r\n\
-        <body>\r\n\
-        <center><h1>404 Not Found</h1></center>\r\n\
-        <hr><center>nginx/1.18.0</center>\r\n\
-        </body>\r\n\
-        </html>\r\n";
+        <html><head><title>404 Not Found</title></head>\
+        <body><center><h1>404 Not Found</h1></center></body></html>\r\n";
 
     let _ = stream.write_all(response).await;
     Ok(())
@@ -256,15 +248,16 @@ pub async fn run_client(
     let connector = TlsConnector::from(Arc::new(config));
     let listener = TcpListener::bind(bind_addr).await?;
 
-    // Увеличенные буферы сокетов
     let socket = socket2::SockRef::from(&listener);
-    let _ = socket.set_recv_buffer_size(2 * 1024 * 1024);
-    let _ = socket.set_send_buffer_size(2 * 1024 * 1024);
+    let _ = socket.set_recv_buffer_size(512 * 1024);
+    let _ = socket.set_send_buffer_size(512 * 1024);
 
     println!("[CLIENT] Local SOCKS proxy on {}", bind_addr);
     println!("[CLIENT] Tunneling to {}", server_addr);
-    println!("[CLIENT] Authentication: ENABLED");
-    println!("[CLIENT] Buffer size: {} KB", BUFFER_SIZE / 1024);
+    println!(
+        "[CLIENT] Buffer size: {} KB (per direction)",
+        BUFFER_SIZE / 1024
+    );
     if skip_verify {
         println!("[WARNING] Certificate verification DISABLED!");
     }
@@ -286,11 +279,10 @@ pub async fn run_client(
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
 
-        // Увеличенные буферы
-        if let Ok(socket) = socket2::SockRef::from(&stream).set_recv_buffer_size(1024 * 1024) {
+        if let Ok(socket) = socket2::SockRef::from(&stream).set_recv_buffer_size(256 * 1024) {
             let _ = socket;
         }
-        if let Ok(socket) = socket2::SockRef::from(&stream).set_send_buffer_size(1024 * 1024) {
+        if let Ok(socket) = socket2::SockRef::from(&stream).set_send_buffer_size(256 * 1024) {
             let _ = socket;
         }
 
@@ -301,7 +293,7 @@ pub async fn run_client(
         let secret = secret.clone();
 
         tokio::spawn(async move {
-            let _permit = match semaphore.acquire().await {
+            let permit = match semaphore.acquire().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
@@ -309,13 +301,15 @@ pub async fn run_client(
             stats.active.fetch_add(1, Ordering::Relaxed);
             stats.total.fetch_add(1, Ordering::Relaxed);
 
-            if let Err(e) =
-                handle_client_connection(stream, connector, &server, &secret, stats.clone()).await
-            {
+            let result =
+                handle_client_connection(stream, connector, &server, &secret, stats.clone()).await;
+
+            if let Err(e) = result {
                 eprintln!("[CLIENT] Error from {}: {}", peer, e);
             }
 
             stats.active.fetch_sub(1, Ordering::Relaxed);
+            drop(permit);
         });
     }
 }
@@ -335,11 +329,10 @@ async fn handle_client_connection(
 
     let _ = tcp_stream.set_nodelay(true);
 
-    // Увеличенные буферы для серверного соединения
-    if let Ok(socket) = socket2::SockRef::from(&tcp_stream).set_recv_buffer_size(1024 * 1024) {
+    if let Ok(socket) = socket2::SockRef::from(&tcp_stream).set_recv_buffer_size(256 * 1024) {
         let _ = socket;
     }
-    if let Ok(socket) = socket2::SockRef::from(&tcp_stream).set_send_buffer_size(1024 * 1024) {
+    if let Ok(socket) = socket2::SockRef::from(&tcp_stream).set_send_buffer_size(256 * 1024) {
         let _ = socket;
     }
 
@@ -369,7 +362,7 @@ where
     Ok(())
 }
 
-// ============ МАКСИМАЛЬНО ОПТИМИЗИРОВАННОЕ КОПИРОВАНИЕ ============
+// ============ ИСПРАВЛЕННОЕ КОПИРОВАНИЕ БЕЗ УТЕЧЕК ============
 
 async fn bidirectional_copy<A, B>(a: A, b: B, stats: Arc<Stats>) -> Result<()>
 where
@@ -381,61 +374,69 @@ where
 
     let stats_ab = stats.clone();
     let copy_a_to_b = async move {
-        let mut buf = vec![0u8; BUFFER_SIZE];
+        // ИСПРАВЛЕНО: Буфер на стеке для небольших размеров
+        // Для 64KB используем Box для гарантированного освобождения
+        let mut buf = Box::new([0u8; BUFFER_SIZE]);
         let mut total = 0u64;
 
         loop {
-            match tokio::time::timeout(READ_TIMEOUT, a_read.read(&mut buf)).await {
-                Ok(Ok(0)) => break,
+            let read_result = tokio::time::timeout(READ_TIMEOUT, a_read.read(&mut buf[..])).await;
+
+            match read_result {
+                Ok(Ok(0)) => break, // EOF
                 Ok(Ok(n)) => {
-                    match b_write.write_all(&buf[..n]).await {
-                        Ok(_) => {
-                            total += n as u64;
-                            // Периодический flush для баланса задержки и пропускной способности
-                            if total % (BUFFER_SIZE as u64 * 4) == 0 {
-                                let _ = b_write.flush().await;
-                            }
-                        }
-                        Err(_) => break,
+                    if b_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    total += n as u64;
+
+                    // Flush каждые 256KB для баланса
+                    if total % (BUFFER_SIZE as u64 * 4) == 0 {
+                        let _ = b_write.flush().await;
                     }
                 }
-                Ok(Err(_)) => break,
-                Err(_) => break, // Timeout
+                Ok(Err(_)) => break, // Read error
+                Err(_) => break,     // Timeout
             }
         }
 
         let _ = b_write.flush().await;
         stats_ab.bytes_rx.fetch_add(total, Ordering::Relaxed);
+
+        // ИСПРАВЛЕНО: Явно дропаем буфер
+        drop(buf);
         total
     };
 
-    let stats_ba = stats.clone();
+    let stats_ba = stats;
     let copy_b_to_a = async move {
-        let mut buf = vec![0u8; BUFFER_SIZE];
+        let mut buf = Box::new([0u8; BUFFER_SIZE]);
         let mut total = 0u64;
 
         loop {
-            match tokio::time::timeout(READ_TIMEOUT, b_read.read(&mut buf)).await {
+            let read_result = tokio::time::timeout(READ_TIMEOUT, b_read.read(&mut buf[..])).await;
+
+            match read_result {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
-                    match a_write.write_all(&buf[..n]).await {
-                        Ok(_) => {
-                            total += n as u64;
-                            // Периодический flush
-                            if total % (BUFFER_SIZE as u64 * 4) == 0 {
-                                let _ = a_write.flush().await;
-                            }
-                        }
-                        Err(_) => break,
+                    if a_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    total += n as u64;
+
+                    if total % (BUFFER_SIZE as u64 * 4) == 0 {
+                        let _ = a_write.flush().await;
                     }
                 }
                 Ok(Err(_)) => break,
-                Err(_) => break, // Timeout
+                Err(_) => break,
             }
         }
 
         let _ = a_write.flush().await;
         stats_ba.bytes_tx.fetch_add(total, Ordering::Relaxed);
+
+        drop(buf);
         total
     };
 
@@ -514,23 +515,23 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("High-Performance TLS Tunnel with Authentication");
-        eprintln!("\nUsage:");
+        eprintln!("TLS Tunnel (Memory-Optimized)\n");
+        eprintln!("Usage:");
         eprintln!(
-            "  Server: {} server <bind_addr> <socks_addr> <cert.pem> <key.pem> <secret_key>",
+            "  Server: {} server <bind> <socks> <cert.pem> <key.pem> <secret>",
             args[0]
         );
         eprintln!(
-            "  Client: {} client <bind_addr> <server_addr> <secret_key> [--insecure]",
+            "  Client: {} client <bind> <server> <secret> [--insecure]\n",
             args[0]
         );
-        eprintln!("\nExample:");
+        eprintln!("Example:");
         eprintln!(
-            "  Server: {} server 0.0.0.0:8443 127.0.0.1:1080 cert.pem key.pem MySecretKey123",
+            "  {} server 0.0.0.0:8443 127.0.0.1:1080 cert.pem key.pem Secret123",
             args[0]
         );
         eprintln!(
-            "  Client: {} client 127.0.0.1:1080 server.example.com:8443 MySecretKey123",
+            "  {} client 127.0.0.1:1080 server.com:8443 Secret123",
             args[0]
         );
         std::process::exit(1);
@@ -539,16 +540,14 @@ async fn main() -> Result<()> {
     match args[1].as_str() {
         "server" => {
             if args.len() < 7 {
-                eprintln!(
-                    "Server needs: <bind_addr> <socks_addr> <cert.pem> <key.pem> <secret_key>"
-                );
+                eprintln!("Server needs: <bind> <socks> <cert.pem> <key.pem> <secret>");
                 std::process::exit(1);
             }
             run_server(&args[2], &args[3], &args[4], &args[5], &args[6]).await?;
         }
         "client" => {
             if args.len() < 5 {
-                eprintln!("Client needs: <bind_addr> <server_addr> <secret_key> [--insecure]");
+                eprintln!("Client needs: <bind> <server> <secret> [--insecure]");
                 std::process::exit(1);
             }
             let skip_verify = args.get(5).map(|s| s == "--insecure").unwrap_or(false);
