@@ -10,10 +10,10 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout, Duration, Instant};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-const BUFFER_SIZE: usize = 64 * 1024;
+const BUFFER_SIZE: usize = 256 * 1024;
 const MAX_CONCURRENT: usize = 10000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-const READ_TIMEOUT: Duration = Duration::from_secs(300);
+const READ_TIMEOUT: Duration = Duration::from_secs(600);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Session management
@@ -577,7 +577,7 @@ where
                     }
                     total += n as u64;
 
-                    if total % (BUFFER_SIZE as u64 * 4) == 0 {
+                    if total % (BUFFER_SIZE as u64 * 16) == 0 {
                         let _ = b_write.flush().await;
                     }
                 }
