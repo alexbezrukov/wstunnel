@@ -586,17 +586,42 @@ async fn handle_client_conn(
     };
     let token = compute_token(secret_key, &nonce);
 
+    // tungstenite requires Sec-WebSocket-Key to be set manually when using custom Request
+    let ws_key = {
+        let mut k = [0u8; 16];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut k);
+        B64.encode(k)
+    };
+
+    // Extract host:port from URL for Host header
+    let url_host = server_url
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
     let mut builder = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(server_url)
+        // Required WebSocket upgrade headers
+        .header("Host", &url_host)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Key", &ws_key)
+        .header("Sec-WebSocket-Version", "13")
+        // Browser fingerprint
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")
+        // Tunnel auth + target
         .header("x-auth", &token)
         .header("x-nonce", &nonce)
-        // Pass target host to server so it knows where to connect
         .header("x-target", &target);
 
+    // CDN fronting: override Host header
     if let Some(host) = host_override {
         builder = builder.header("Host", host);
     }
