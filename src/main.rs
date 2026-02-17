@@ -398,9 +398,10 @@ async fn handle_server_conn(
 
     let expected_path = ws_path.to_string();
     let secret = secret_key.to_string();
-    let auth_ok = Arc::new(Mutex::new(false));
+    // Use std::sync::Mutex — the callback is sync, can't use tokio::Mutex::blocking_lock()
+    let auth_ok = Arc::new(std::sync::Mutex::new(false));
     let auth_cb = auth_ok.clone();
-    let target_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let target_cell: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let target_cb = target_cell.clone();
 
     let ws = timeout(
@@ -416,11 +417,14 @@ async fn handle_server_conn(
             {
                 let nonce = n.to_str().unwrap_or("");
                 if a.to_str().unwrap_or("") == compute_token(&secret, nonce) {
-                    // Capture target host:port from x-target header
                     if let Some(t) = req.headers().get("x-target") {
-                        *target_cb.blocking_lock() = Some(t.to_str().unwrap_or("").to_string());
+                        if let Ok(mut g) = target_cb.lock() {
+                            *g = Some(t.to_str().unwrap_or("").to_string());
+                        }
                     }
-                    *auth_cb.blocking_lock() = true;
+                    if let Ok(mut g) = auth_cb.lock() {
+                        *g = true;
+                    }
                     resp.headers_mut()
                         .insert("server", HeaderValue::from_static("cloudflare"));
                     return Ok(resp);
@@ -435,14 +439,14 @@ async fn handle_server_conn(
     .await
     .context("WS upgrade timeout")??;
 
-    if !*auth_ok.lock().await {
+    if !*auth_ok.lock().unwrap_or_else(|e| e.into_inner()) {
         stats.auth_failed.fetch_add(1, Ordering::Relaxed);
         return Err(anyhow::anyhow!("Auth failed from {}", peer));
     }
 
     let target = target_cell
         .lock()
-        .await
+        .unwrap_or_else(|e| e.into_inner())
         .clone()
         .context("Missing x-target header")?;
 
