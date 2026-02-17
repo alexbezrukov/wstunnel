@@ -1,17 +1,42 @@
 [package]
-name = "tls-socks-tunnel"
-version = "0.1.0"
+name = "tls_tunnel_v3"
+version = "0.3.0"
 edition = "2021"
 
+[[bin]]
+name = "tunnel"
+path = "src/main.rs"
+
 [dependencies]
+# Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = "0.25"
-rustls = "0.22"
-rustls-pemfile = "2.0"
+tokio-rustls = "0.26"
+
+# WebSocket (key change vs v2)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# TLS
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
 webpki-roots = "0.26"
-anyhow = "1.0"
-socket2 = "0.5"
-dashmap = "5.5"
+
+# Crypto
 sha2 = "0.10"
 rand = "0.8"
-hex = "0.4"
+base64 = "0.22"
+
+# HTTP types (used by tungstenite)
+http = "1"
+
+# Sys / socket tuning
+socket2 = { version = "0.5", features = ["all"] }
+
+# Error handling
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,30 +1,30 @@
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
-use tokio::time::{timeout, Duration, Instant};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio::time::{timeout, Duration};
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{accept_hdr_async, connect_async_tls_with_config};
 
-const BUFFER_SIZE: usize = 256 * 1024;
-const MAX_CONCURRENT: usize = 10000;
+// ── Tuning ─────────────────────────────────────────────────────────────────
+const BUFFER_SIZE: usize = 128 * 1024;
+const MAX_CONCURRENT: usize = 10_000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
-const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+// const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Session management
-const SESSION_TOKEN_SIZE: usize = 32;
-const SESSION_LIFETIME: Duration = Duration::from_secs(3600); // 1 hour
-const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(300); // 5 min
+// ── Auth ────────────────────────────────────────────────────────────────────
+const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V3_WS";
 
-const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V2_SESSION";
-const AUTH_CHALLENGE_SIZE: usize = 32;
-const AUTH_RESPONSE_SIZE: usize = 32;
-
+// ── Stats ───────────────────────────────────────────────────────────────────
 #[derive(Default)]
 struct Stats {
     active: AtomicU64,
@@ -32,37 +32,24 @@ struct Stats {
     bytes_rx: AtomicU64,
     bytes_tx: AtomicU64,
     auth_failed: AtomicU64,
-    sessions_created: AtomicU64,
-    sessions_reused: AtomicU64,
 }
 
 impl Stats {
     fn report(&self) {
-        let active = self.active.load(Ordering::Relaxed);
-        let total = self.total.load(Ordering::Relaxed);
-        let rx_mb = self.bytes_rx.load(Ordering::Relaxed) / 1_000_000;
-        let tx_mb = self.bytes_tx.load(Ordering::Relaxed) / 1_000_000;
-        let failed = self.auth_failed.load(Ordering::Relaxed);
-        let created = self.sessions_created.load(Ordering::Relaxed);
-        let reused = self.sessions_reused.load(Ordering::Relaxed);
-
         println!(
-            "[STATS] Active: {}, Total: {}, Failed: {}, Sessions: {}/{}, RX: {} MB, TX: {} MB",
-            active, total, failed, created, reused, rx_mb, tx_mb
+            "[STATS] Active:{} Total:{} Failed:{} RX:{}MB TX:{}MB",
+            self.active.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+            self.auth_failed.load(Ordering::Relaxed),
+            self.bytes_rx.load(Ordering::Relaxed) / 1_000_000,
+            self.bytes_tx.load(Ordering::Relaxed) / 1_000_000,
         );
     }
 }
 
-// Session tracking
-struct Session {
-    token: [u8; SESSION_TOKEN_SIZE],
-    created_at: Instant,
-    last_used: Instant,
-}
-
-type SessionStore = Arc<Mutex<HashMap<[u8; SESSION_TOKEN_SIZE], Session>>>;
-
-// ============ SERVER SIDE ============
+// ═══════════════════════════════════════════════════════════════════════════
+//  SERVER
+// ═══════════════════════════════════════════════════════════════════════════
 
 pub async fn run_server(
     bind_addr: &str,
@@ -70,605 +57,466 @@ pub async fn run_server(
     cert_path: &str,
     key_path: &str,
     secret_key: &str,
+    ws_path: &str,
 ) -> Result<()> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
-    let mut config = rustls::ServerConfig::builder()
+    let mut tls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .context("Invalid cert/key")?;
+        .context("Bad cert/key")?;
 
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config.max_fragment_size = Some(16384);
+    // Advertise h2 + http/1.1 — looks like a normal HTTPS server
+    tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_cfg.max_fragment_size = Some(16384);
 
-    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg));
     let listener = TcpListener::bind(bind_addr).await?;
-
-    let socket = socket2::SockRef::from(&listener);
-    let _ = socket.set_recv_buffer_size(512 * 1024);
-    let _ = socket.set_send_buffer_size(512 * 1024);
+    set_sock_buf(&listener);
 
     println!("[SERVER] Listening on {}", bind_addr);
-    println!("[SERVER] Forwarding to SOCKS at {}", socks_addr);
-    println!(
-        "[SERVER] Session-based auth enabled (lifetime: {}s)",
-        SESSION_LIFETIME.as_secs()
-    );
+    println!("[SERVER] WebSocket path: {}", ws_path);
+    println!("[SERVER] Forwarding to SOCKS: {}", socks_addr);
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let stats = Arc::new(Stats::default());
     let secret = Arc::new(secret_key.to_string());
-    let sessions: SessionStore = Arc::new(Mutex::new(HashMap::new()));
+    let ws_path = Arc::new(ws_path.to_string());
 
     // Stats reporter
-    let stats_clone = stats.clone();
+    let s = stats.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut iv = tokio::time::interval(Duration::from_secs(30));
         loop {
-            interval.tick().await;
-            stats_clone.report();
-        }
-    });
-
-    // Session cleanup task
-    let sessions_clone = sessions.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(SESSION_CLEANUP_INTERVAL);
-        loop {
-            interval.tick().await;
-            cleanup_expired_sessions(&sessions_clone).await;
+            iv.tick().await;
+            s.report();
         }
     });
 
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let _ = stream.set_nodelay(true);
-
-        if let Ok(socket) = socket2::SockRef::from(&stream).set_recv_buffer_size(256 * 1024) {
-            let _ = socket;
-        }
-        if let Ok(socket) = socket2::SockRef::from(&stream).set_send_buffer_size(256 * 1024) {
-            let _ = socket;
-        }
+        let (tcp, peer) = listener.accept().await?;
+        let _ = tcp.set_nodelay(true);
+        set_tcp_buf(&tcp);
 
         let acceptor = acceptor.clone();
         let socks = socks_addr.to_string();
-        let semaphore = semaphore.clone();
+        let sem = sem.clone();
         let stats = stats.clone();
         let secret = secret.clone();
-        let sessions = sessions.clone();
+        let ws_path = ws_path.clone();
 
         tokio::spawn(async move {
-            let permit = match semaphore.acquire().await {
+            let _permit = match sem.acquire().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
-
             stats.active.fetch_add(1, Ordering::Relaxed);
             stats.total.fetch_add(1, Ordering::Relaxed);
 
-            let result = handle_server_connection(
-                stream,
+            if let Err(e) = handle_server_conn(
+                tcp,
                 acceptor,
                 &socks,
                 &secret,
-                sessions,
+                &ws_path,
                 stats.clone(),
                 peer,
             )
-            .await;
-
-            if let Err(e) = result {
-                if !e.to_string().contains("Authentication failed") {
-                    eprintln!("[SERVER] Error from {}: {}", peer, e);
+            .await
+            {
+                let s = e.to_string();
+                if !s.contains("Auth") && !s.contains("auth") {
+                    eprintln!("[SERVER] {} — {}", peer, e);
                 }
             }
-
             stats.active.fetch_sub(1, Ordering::Relaxed);
-            drop(permit);
         });
     }
 }
 
-async fn handle_server_connection(
-    stream: TcpStream,
-    acceptor: TlsAcceptor,
+async fn handle_server_conn(
+    tcp: TcpStream,
+    acceptor: tokio_rustls::TlsAcceptor,
     socks_addr: &str,
     secret_key: &str,
-    sessions: SessionStore,
+    ws_path: &str,
     stats: Arc<Stats>,
     peer: std::net::SocketAddr,
 ) -> Result<()> {
-    let mut tls_stream = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+    // ── TLS handshake ───────────────────────────────────────────────────────
+    let tls = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
         .await
-        .context("TLS handshake timeout")??;
+        .context("TLS timeout")??;
 
-    // Read first byte to determine if this is auth or session reuse
-    let mut mode_byte = [0u8; 1];
-    timeout(AUTH_TIMEOUT, tls_stream.read_exact(&mut mode_byte))
-        .await
-        .context("Mode byte timeout")??;
+    // ── WebSocket upgrade with auth check in headers ────────────────────────
+    let expected_path = ws_path.to_string();
+    let secret = secret_key.to_string();
+    let auth_ok = Arc::new(Mutex::new(false));
+    let auth_ok_cb = auth_ok.clone();
 
-    match mode_byte[0] {
-        0x01 => {
-            // New authentication
-            if !authenticate_client_new(&mut tls_stream, secret_key).await? {
-                stats.auth_failed.fetch_add(1, Ordering::Relaxed);
-                eprintln!("[SERVER] Auth failed: {}", peer);
-                send_decoy_response(&mut tls_stream).await?;
-                return Err(anyhow::anyhow!("Authentication failed"));
+    let ws = timeout(
+        HANDSHAKE_TIMEOUT,
+        accept_hdr_async(tls, move |req: &Request, mut resp: Response| {
+            // 1. Path check
+            if req.uri().path() != expected_path {
+                *resp.status_mut() = StatusCode::NOT_FOUND;
+                return Err(resp.map(|_| None));
             }
 
-            // Generate and send session token
-            let token = generate_session_token();
-            tls_stream.write_all(&token).await?;
-            tls_stream.flush().await?;
-
-            // Store session
-            let session = Session {
-                token,
-                created_at: Instant::now(),
-                last_used: Instant::now(),
-            };
-            sessions.lock().await.insert(token, session);
-            stats.sessions_created.fetch_add(1, Ordering::Relaxed);
-
-            println!("[SERVER] New session: {}", peer);
-        }
-        0x02 => {
-            // Session reuse
-            let mut token = [0u8; SESSION_TOKEN_SIZE];
-            timeout(AUTH_TIMEOUT, tls_stream.read_exact(&mut token))
-                .await
-                .context("Session token timeout")??;
-
-            let mut sessions_lock = sessions.lock().await;
-            if let Some(session) = sessions_lock.get_mut(&token) {
-                // Check if session is still valid
-                if session.created_at.elapsed() < SESSION_LIFETIME {
-                    session.last_used = Instant::now();
-                    drop(sessions_lock);
-
-                    // Send success
-                    tls_stream.write_all(&[0x01]).await?;
-                    tls_stream.flush().await?;
-
-                    stats.sessions_reused.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    // Session expired
-                    sessions_lock.remove(&token);
-                    drop(sessions_lock);
-
-                    tls_stream.write_all(&[0x00]).await?;
-                    tls_stream.flush().await?;
-
-                    return Err(anyhow::anyhow!("Session expired"));
+            // 2. Auth token in header: X-Auth: HMAC-SHA256(secret, nonce)
+            //    Nonce is sent as X-Nonce header by client
+            if let (Some(auth_hdr), Some(nonce_hdr)) =
+                (req.headers().get("x-auth"), req.headers().get("x-nonce"))
+            {
+                let nonce = nonce_hdr.to_str().unwrap_or("");
+                let expected_token = compute_token(&secret, nonce);
+                if auth_hdr.to_str().unwrap_or("") == expected_token {
+                    *auth_ok_cb.blocking_lock() = true;
+                    // Add server headers to look like a normal WS upgrade
+                    resp.headers_mut()
+                        .insert("server", HeaderValue::from_static("cloudflare"));
+                    return Ok(resp);
                 }
-            } else {
-                drop(sessions_lock);
-
-                // Invalid session
-                tls_stream.write_all(&[0x00]).await?;
-                tls_stream.flush().await?;
-
-                stats.auth_failed.fetch_add(1, Ordering::Relaxed);
-                return Err(anyhow::anyhow!("Invalid session token"));
             }
-        }
-        _ => {
-            return Err(anyhow::anyhow!("Invalid mode byte"));
-        }
+
+            *resp.status_mut() = StatusCode::UNAUTHORIZED;
+            Err(resp.map(|_| None))
+        }),
+    )
+    .await
+    .context("WS handshake timeout")??;
+
+    if !*auth_ok.lock().await {
+        stats.auth_failed.fetch_add(1, Ordering::Relaxed);
+        return Err(anyhow::anyhow!("Auth failed from {}", peer));
     }
 
-    // Connect to SOCKS
-    let socks_stream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(socks_addr))
+    // ── Connect to local SOCKS ──────────────────────────────────────────────
+    let socks = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(socks_addr))
         .await
-        .context("SOCKS connect timeout")??;
+        .context("SOCKS timeout")??;
+    let _ = socks.set_nodelay(true);
+    set_tcp_buf(&socks);
 
-    let _ = socks_stream.set_nodelay(true);
-
-    if let Ok(socket) = socket2::SockRef::from(&socks_stream).set_recv_buffer_size(256 * 1024) {
-        let _ = socket;
-    }
-    if let Ok(socket) = socket2::SockRef::from(&socks_stream).set_send_buffer_size(256 * 1024) {
-        let _ = socket;
-    }
-
-    bidirectional_copy(tls_stream, socks_stream, stats).await
+    proxy_ws_tcp(ws, socks, stats).await
 }
 
-async fn authenticate_client_new<S>(stream: &mut S, secret_key: &str) -> Result<bool>
-where
-    S: AsyncReadExt + AsyncWriteExt + Unpin,
-{
-    let mut challenge = [0u8; AUTH_CHALLENGE_SIZE];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut challenge);
-
-    stream.write_all(&challenge).await?;
-    stream.flush().await?;
-
-    let mut response = [0u8; AUTH_RESPONSE_SIZE];
-    timeout(AUTH_TIMEOUT, stream.read_exact(&mut response))
-        .await
-        .context("Auth timeout")??;
-
-    let expected = compute_auth_response(&challenge, secret_key);
-    Ok(response == expected)
-}
-
-fn generate_session_token() -> [u8; SESSION_TOKEN_SIZE] {
-    let mut token = [0u8; SESSION_TOKEN_SIZE];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut token);
-    token
-}
-
-async fn cleanup_expired_sessions(sessions: &SessionStore) {
-    let mut sessions = sessions.lock().await;
-    let before = sessions.len();
-    sessions.retain(|_, session| session.created_at.elapsed() < SESSION_LIFETIME);
-    let after = sessions.len();
-    if before != after {
-        println!("[SERVER] Cleaned {} expired sessions", before - after);
-    }
-}
-
-fn compute_auth_response(challenge: &[u8], secret: &str) -> [u8; AUTH_RESPONSE_SIZE] {
-    let mut hasher = Sha256::new();
-    hasher.update(AUTH_MAGIC);
-    hasher.update(challenge);
-    hasher.update(secret.as_bytes());
-    let result = hasher.finalize();
-
-    let mut output = [0u8; AUTH_RESPONSE_SIZE];
-    output.copy_from_slice(&result[..AUTH_RESPONSE_SIZE]);
-    output
-}
-
-async fn send_decoy_response<S>(stream: &mut S) -> Result<()>
-where
-    S: AsyncWriteExt + Unpin,
-{
-    let response = b"HTTP/1.1 404 Not Found\r\n\
-        Server: nginx/1.18.0\r\n\
-        Content-Length: 146\r\n\
-        Connection: close\r\n\
-        \r\n\
-        <html><head><title>404 Not Found</title></head>\
-        <body><center><h1>404 Not Found</h1></center></body></html>\r\n";
-
-    let _ = stream.write_all(response).await;
-    Ok(())
-}
-
-// ============ CLIENT SIDE ============
+// ═══════════════════════════════════════════════════════════════════════════
+//  CLIENT
+// ═══════════════════════════════════════════════════════════════════════════
 
 pub async fn run_client(
     bind_addr: &str,
-    server_addr: &str,
+    server_url: &str, // wss://host:port/path  OR  wss://cdn-host/path?target=origin
     secret_key: &str,
     skip_verify: bool,
+    host_header: Option<&str>, // CDN fronting: SNI = cdn, Host = cdn, but connect to origin IP
 ) -> Result<()> {
-    let mut config = if skip_verify {
+    let listener = TcpListener::bind(bind_addr).await?;
+    set_sock_buf(&listener);
+
+    println!("[CLIENT] Local SOCKS on {}", bind_addr);
+    println!("[CLIENT] Tunnel URL: {}", server_url);
+    if let Some(h) = host_header {
+        println!("[CLIENT] CDN fronting host: {}", h);
+    }
+
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let stats = Arc::new(Stats::default());
+    let secret = Arc::new(secret_key.to_string());
+    let url = Arc::new(server_url.to_string());
+    let host_hdr = host_header.map(|h| h.to_string());
+    let host_hdr = Arc::new(host_hdr);
+
+    let tls_cfg = build_client_tls(skip_verify)?;
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_cfg));
+    let connector = Arc::new(connector);
+
+    let s = stats.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            iv.tick().await;
+            s.report();
+        }
+    });
+
+    loop {
+        let (tcp, peer) = listener.accept().await?;
+        let _ = tcp.set_nodelay(true);
+        set_tcp_buf(&tcp);
+
+        let sem = sem.clone();
+        let stats = stats.clone();
+        let secret = secret.clone();
+        let url = url.clone();
+        let host_hdr = host_hdr.clone();
+        let connector = connector.clone();
+
+        tokio::spawn(async move {
+            let _permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            stats.active.fetch_add(1, Ordering::Relaxed);
+            stats.total.fetch_add(1, Ordering::Relaxed);
+
+            if let Err(e) = handle_client_conn(
+                tcp,
+                &url,
+                &secret,
+                host_hdr.as_deref(),
+                connector,
+                stats.clone(),
+            )
+            .await
+            {
+                eprintln!("[CLIENT] {} — {}", peer, e);
+            }
+            stats.active.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+}
+
+async fn handle_client_conn(
+    local: TcpStream,
+    server_url: &str,
+    secret_key: &str,
+    host_override: Option<&str>,
+    connector: Arc<tokio_tungstenite::Connector>,
+    stats: Arc<Stats>,
+) -> Result<()> {
+    // Build nonce + auth token
+    let nonce = {
+        let mut b = [0u8; 16];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut b);
+        B64.encode(b)
+    };
+    let token = compute_token(secret_key, &nonce);
+
+    // Build request with browser-like headers
+    let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(server_url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .header("x-auth", &token)
+        .header("x-nonce", &nonce);
+
+    // CDN fronting: override Host header
+    if let Some(host) = host_override {
+        req = req.header("Host", host);
+    }
+
+    let req = req.body(()).context("Bad request")?;
+
+    let (ws, _resp) = timeout(
+        HANDSHAKE_TIMEOUT,
+        connect_async_tls_with_config(req, None, false, Some((*connector).clone())),
+    )
+    .await
+    .context("WS connect timeout")??;
+
+    proxy_ws_tcp(ws, local, stats).await
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BIDIRECTIONAL PROXY: WebSocket ↔ raw TCP
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn proxy_ws_tcp<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    tcp: TcpStream,
+    stats: Arc<Stats>,
+) -> Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (mut tcp_rx, mut tcp_tx) = tokio::io::split(tcp);
+
+    let stats_a = stats.clone();
+    // TCP → WebSocket (upload direction)
+    let tcp_to_ws = async move {
+        let mut buf = vec![0u8; BUFFER_SIZE];
+        let mut total = 0u64;
+        loop {
+            match timeout(READ_TIMEOUT, tcp_rx.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    let msg = Message::Binary(buf[..n].to_vec().into());
+                    if ws_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                    total += n as u64;
+                }
+            }
+        }
+        let _ = ws_tx.close().await;
+        stats_a.bytes_tx.fetch_add(total, Ordering::Relaxed);
+        total
+    };
+
+    let stats_b = stats;
+    // WebSocket → TCP (download direction — this is what gets throttled)
+    let ws_to_tcp = async move {
+        let mut total = 0u64;
+        while let Ok(Some(msg)) = timeout(READ_TIMEOUT, ws_rx.next()).await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    if tcp_tx.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    total += data.len() as u64;
+                }
+                Ok(Message::Ping(d)) => {
+                    /* pong handled by tungstenite */
+                    let _ = d;
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+        let _ = tcp_tx.flush().await;
+        stats_b.bytes_rx.fetch_add(total, Ordering::Relaxed);
+        total
+    };
+
+    let (tx, rx) = tokio::join!(tcp_to_ws, ws_to_tcp);
+    if tx > 0 || rx > 0 {
+        println!("[CONN] Closed TX:{}KB RX:{}KB", tx / 1024, rx / 1024);
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CLOUDFLARE WORKER  (JS — printed to stdout, copy-paste to CF dashboard)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn print_cf_worker(origin: &str, ws_path: &str) {
+    println!(
+        r#"
+// ── Cloudflare Worker (paste into CF Dashboard → Workers) ──────────────────
+// Routes: *.your-zone.com/*  →  this worker
+// Environment variable: ORIGIN_HOST = "{origin}"  (ip:port of your server)
+// ───────────────────────────────────────────────────────────────────────────
+
+export default {{
+  async fetch(request, env) {{
+    const url = new URL(request.url);
+
+    // Only proxy our tunnel path
+    if (url.pathname !== "{ws_path}") {{
+      return new Response("Not Found", {{ status: 404 }});
+    }}
+
+    // Forward WebSocket upgrade to origin
+    const originUrl = "wss://" + env.ORIGIN_HOST + "{ws_path}";
+    const headers = new Headers(request.headers);
+    headers.set("Host", env.ORIGIN_HOST.split(":")[0]);
+
+    // CF handles the TLS to origin automatically
+    return fetch(originUrl, {{
+      method: request.method,
+      headers,
+      body: request.body,
+    }});
+  }},
+}};
+// ─────────────────────────────────────────────────────────────────────────
+"#
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn compute_token(secret: &str, nonce: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(AUTH_MAGIC);
+    h.update(secret.as_bytes());
+    h.update(nonce.as_bytes());
+    B64.encode(h.finalize())
+}
+
+fn build_client_tls(skip_verify: bool) -> Result<rustls::ClientConfig> {
+    let cfg = if skip_verify {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
             .with_no_client_auth()
     } else {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
+            .with_root_certificates(roots)
             .with_no_client_auth()
     };
-
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config.max_fragment_size = Some(16384);
-    config.resumption = rustls::client::Resumption::default();
-
-    let connector = TlsConnector::from(Arc::new(config));
-    let listener = TcpListener::bind(bind_addr).await?;
-
-    let socket = socket2::SockRef::from(&listener);
-    let _ = socket.set_recv_buffer_size(512 * 1024);
-    let _ = socket.set_send_buffer_size(512 * 1024);
-
-    println!("[CLIENT] Local SOCKS proxy on {}", bind_addr);
-    println!("[CLIENT] Tunneling to {}", server_addr);
-    println!("[CLIENT] Session-based auth enabled");
-    if skip_verify {
-        println!("[WARNING] Certificate verification DISABLED!");
-    }
-
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
-    let stats = Arc::new(Stats::default());
-    let secret = Arc::new(secret_key.to_string());
-    let session_token: Arc<Mutex<Option<[u8; SESSION_TOKEN_SIZE]>>> = Arc::new(Mutex::new(None));
-
-    let stats_clone = stats.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            stats_clone.report();
-        }
-    });
-
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let _ = stream.set_nodelay(true);
-
-        if let Ok(socket) = socket2::SockRef::from(&stream).set_recv_buffer_size(256 * 1024) {
-            let _ = socket;
-        }
-        if let Ok(socket) = socket2::SockRef::from(&stream).set_send_buffer_size(256 * 1024) {
-            let _ = socket;
-        }
-
-        let connector = connector.clone();
-        let server = server_addr.to_string();
-        let semaphore = semaphore.clone();
-        let stats = stats.clone();
-        let secret = secret.clone();
-        let session_token = session_token.clone();
-
-        tokio::spawn(async move {
-            let permit = match semaphore.acquire().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-
-            stats.active.fetch_add(1, Ordering::Relaxed);
-            stats.total.fetch_add(1, Ordering::Relaxed);
-
-            let result = handle_client_connection(
-                stream,
-                connector,
-                &server,
-                &secret,
-                session_token,
-                stats.clone(),
-            )
-            .await;
-
-            if let Err(e) = result {
-                eprintln!("[CLIENT] Error from {}: {}", peer, e);
-            }
-
-            stats.active.fetch_sub(1, Ordering::Relaxed);
-            drop(permit);
-        });
-    }
+    Ok(cfg)
 }
 
-async fn handle_client_connection(
-    local_stream: TcpStream,
-    connector: TlsConnector,
-    server_addr: &str,
-    secret_key: &str,
-    session_token: Arc<Mutex<Option<[u8; SESSION_TOKEN_SIZE]>>>,
-    stats: Arc<Stats>,
-) -> Result<()> {
-    let server_name = server_addr.split(':').next().unwrap();
-
-    let tcp_stream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(server_addr))
-        .await
-        .context("Server connect timeout")??;
-
-    let _ = tcp_stream.set_nodelay(true);
-
-    if let Ok(socket) = socket2::SockRef::from(&tcp_stream).set_recv_buffer_size(256 * 1024) {
-        let _ = socket;
-    }
-    if let Ok(socket) = socket2::SockRef::from(&tcp_stream).set_send_buffer_size(256 * 1024) {
-        let _ = socket;
-    }
-
-    let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())?;
-    let mut tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(domain, tcp_stream))
-        .await
-        .context("TLS handshake timeout")??;
-
-    // Try to reuse existing session
-    let token = session_token.lock().await.clone();
-
-    if let Some(token) = token {
-        // Try session reuse
-        tls_stream.write_all(&[0x02]).await?; // Mode: reuse
-        tls_stream.write_all(&token).await?;
-        tls_stream.flush().await?;
-
-        let mut response = [0u8; 1];
-        timeout(AUTH_TIMEOUT, tls_stream.read_exact(&mut response))
-            .await
-            .context("Session response timeout")??;
-
-        if response[0] == 0x01 {
-            // Session accepted
-            stats.sessions_reused.fetch_add(1, Ordering::Relaxed);
-        } else {
-            // Session rejected, need full auth
-            drop(tls_stream);
-
-            // Reconnect
-            let tcp_stream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(server_addr))
-                .await
-                .context("Server reconnect timeout")??;
-            let _ = tcp_stream.set_nodelay(true);
-
-            let domain = rustls::pki_types::ServerName::try_from(server_name.to_string())?;
-            tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(domain, tcp_stream))
-                .await
-                .context("TLS handshake timeout")??;
-
-            authenticate_and_get_token(&mut tls_stream, secret_key, session_token.clone()).await?;
-            stats.sessions_created.fetch_add(1, Ordering::Relaxed);
-        }
-    } else {
-        // No session, do full auth
-        authenticate_and_get_token(&mut tls_stream, secret_key, session_token.clone()).await?;
-        stats.sessions_created.fetch_add(1, Ordering::Relaxed);
-    }
-
-    bidirectional_copy(local_stream, tls_stream, stats).await
+fn set_sock_buf<T: std::os::fd::AsFd>(s: &T) {
+    let sock = socket2::SockRef::from(s);
+    let _ = sock.set_recv_buffer_size(1 << 20); // 1 MB
+    let _ = sock.set_send_buffer_size(1 << 20);
 }
 
-async fn authenticate_and_get_token<S>(
-    stream: &mut S,
-    secret_key: &str,
-    session_token: Arc<Mutex<Option<[u8; SESSION_TOKEN_SIZE]>>>,
-) -> Result<()>
-where
-    S: AsyncReadExt + AsyncWriteExt + Unpin,
-{
-    // Send auth mode
-    stream.write_all(&[0x01]).await?; // Mode: new auth
-    stream.flush().await?;
-
-    // Receive challenge
-    let mut challenge = [0u8; AUTH_CHALLENGE_SIZE];
-    timeout(AUTH_TIMEOUT, stream.read_exact(&mut challenge))
-        .await
-        .context("Auth challenge timeout")??;
-
-    // Send response
-    let response = compute_auth_response(&challenge, secret_key);
-    stream.write_all(&response).await?;
-    stream.flush().await?;
-
-    // Receive session token
-    let mut token = [0u8; SESSION_TOKEN_SIZE];
-    timeout(AUTH_TIMEOUT, stream.read_exact(&mut token))
-        .await
-        .context("Session token timeout")??;
-
-    // Store token
-    *session_token.lock().await = Some(token);
-    println!("[CLIENT] New session established");
-
-    Ok(())
+fn set_tcp_buf(s: &TcpStream) {
+    let sock = socket2::SockRef::from(s);
+    let _ = sock.set_recv_buffer_size(512 * 1024);
+    let _ = sock.set_send_buffer_size(512 * 1024);
 }
 
-// ============ BIDIRECTIONAL COPY ============
-
-async fn bidirectional_copy<A, B>(a: A, b: B, stats: Arc<Stats>) -> Result<()>
-where
-    A: AsyncReadExt + AsyncWriteExt + Unpin,
-    B: AsyncReadExt + AsyncWriteExt + Unpin,
-{
-    let (mut a_read, mut a_write) = tokio::io::split(a);
-    let (mut b_read, mut b_write) = tokio::io::split(b);
-
-    let stats_ab = stats.clone();
-    let copy_a_to_b = async move {
-        let mut buf = Box::new([0u8; BUFFER_SIZE]);
-        let mut total = 0u64;
-
-        loop {
-            let read_result = tokio::time::timeout(READ_TIMEOUT, a_read.read(&mut buf[..])).await;
-
-            match read_result {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => {
-                    if b_write.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                    total += n as u64;
-
-                    if total % (BUFFER_SIZE as u64 * 16) == 0 {
-                        let _ = b_write.flush().await;
-                    }
-                }
-                Ok(Err(_)) => break,
-                Err(_) => break,
-            }
-        }
-
-        let _ = b_write.flush().await;
-        stats_ab.bytes_rx.fetch_add(total, Ordering::Relaxed);
-
-        drop(buf);
-        total
-    };
-
-    let stats_ba = stats;
-    let copy_b_to_a = async move {
-        let mut buf = Box::new([0u8; BUFFER_SIZE]);
-        let mut total = 0u64;
-
-        loop {
-            let read_result = tokio::time::timeout(READ_TIMEOUT, b_read.read(&mut buf[..])).await;
-
-            match read_result {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => {
-                    if a_write.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                    total += n as u64;
-
-                    if total % (BUFFER_SIZE as u64 * 4) == 0 {
-                        let _ = a_write.flush().await;
-                    }
-                }
-                Ok(Err(_)) => break,
-                Err(_) => break,
-            }
-        }
-
-        let _ = a_write.flush().await;
-        stats_ba.bytes_tx.fetch_add(total, Ordering::Relaxed);
-
-        drop(buf);
-        total
-    };
-
-    let (rx, tx) = tokio::join!(copy_a_to_b, copy_b_to_a);
-
-    if rx > 0 || tx > 0 {
-        println!("[CONN] Closed: RX {} KB, TX {} KB", rx / 1024, tx / 1024);
-    }
-
-    Ok(())
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let f = std::fs::File::open(path)?;
+    let mut r = std::io::BufReader::new(f);
+    Ok(rustls_pemfile::certs(&mut r).collect::<Result<Vec<_>, _>>()?)
 }
 
-// ============ HELPER FUNCTIONS ============
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    let f = std::fs::File::open(path)?;
+    let mut r = std::io::BufReader::new(f);
+    Ok(rustls_pemfile::private_key(&mut r)?.context("No private key")?)
+}
 
+// ── NoCertVerifier (for --insecure) ────────────────────────────────────────
 #[derive(Debug)]
 struct NoCertVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     fn verify_server_cert(
         &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
+        _: &CertificateDer,
+        _: &[CertificateDer],
+        _: &rustls::pki_types::ServerName,
         _: &[u8],
         _: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
-
     fn verify_tls12_signature(
         &self,
         _: &[u8],
-        _: &CertificateDer<'_>,
+        _: &CertificateDer,
         _: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
-
     fn verify_tls13_signature(
         &self,
         _: &[u8],
-        _: &CertificateDer<'_>,
+        _: &CertificateDer,
         _: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
-
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         vec![
             rustls::SignatureScheme::RSA_PKCS1_SHA256,
@@ -679,70 +527,70 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     }
 }
 
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-    Ok(certs)
-}
+// ═══════════════════════════════════════════════════════════════════════════
+//  MAIN
+// ═══════════════════════════════════════════════════════════════════════════
 
-fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let keys = rustls_pemfile::private_key(&mut reader)?.context("No private key found")?;
-    Ok(keys)
-}
-
-// ============ MAIN ============
-
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("TLS Tunnel (Session-Based Auth)\n");
-        eprintln!("Usage:");
+    let help = || {
         eprintln!(
-            "  Server: {} server <bind> <socks> <cert.pem> <key.pem> <secret>",
-            args[0]
-        );
-        eprintln!(
-            "  Client: {} client <bind> <server> <secret> [--insecure]\n",
-            args[0]
-        );
-        eprintln!("Example:");
-        eprintln!(
-            "  {} server 0.0.0.0:8443 127.0.0.1:1080 cert.pem key.pem Secret123",
-            args[0]
-        );
-        eprintln!(
-            "  {} client 127.0.0.1:1080 server.com:8443 Secret123",
-            args[0]
-        );
-        std::process::exit(1);
-    }
+            r#"TLS WebSocket Tunnel v3 (CDN-fronting ready)
 
-    match args[1].as_str() {
-        "server" => {
+USAGE:
+  server  <bind> <socks> <cert> <key> <secret> [ws-path]
+  client  <bind> <wss-url> <secret> [--insecure] [--host <cdn-host>]
+  worker  <origin-host:port> [ws-path]
+
+EXAMPLES:
+  # Server (your VPS):
+  {0} server 0.0.0.0:443 127.0.0.1:1080 cert.pem key.pem MySecret /api/v1/stream
+
+  # Client — direct:
+  {0} client 127.0.0.1:1080 wss://server.com:443/api/v1/stream MySecret
+
+  # Client — through Cloudflare (CDN fronting):
+  {0} client 127.0.0.1:1080 wss://your-cf-worker.your-zone.com/api/v1/stream MySecret
+
+  # Print Cloudflare Worker JS to copy-paste:
+  {0} worker server.com:443 /api/v1/stream
+"#,
+            args[0]
+        );
+    };
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("server") => {
             if args.len() < 7 {
-                eprintln!("Server needs: <bind> <socks> <cert.pem> <key.pem> <secret>");
+                help();
                 std::process::exit(1);
             }
-            run_server(&args[2], &args[3], &args[4], &args[5], &args[6]).await?;
+            let ws_path = args.get(7).map(|s| s.as_str()).unwrap_or("/ws");
+            run_server(&args[2], &args[3], &args[4], &args[5], &args[6], ws_path).await?;
         }
-        "client" => {
+        Some("client") => {
             if args.len() < 5 {
-                eprintln!("Client needs: <bind> <server> <secret> [--insecure]");
+                help();
                 std::process::exit(1);
             }
-            let skip_verify = args.get(5).map(|s| s == "--insecure").unwrap_or(false);
-            run_client(&args[2], &args[3], &args[4], skip_verify).await?;
+            let skip_verify = args.iter().any(|a| a == "--insecure");
+            let host_override = args
+                .windows(2)
+                .find(|w| w[0] == "--host")
+                .map(|w| w[1].as_str());
+            run_client(&args[2], &args[3], &args[4], skip_verify, host_override).await?;
+        }
+        Some("worker") => {
+            let origin = args.get(2).map(|s| s.as_str()).unwrap_or("YOUR_SERVER:443");
+            let ws_path = args.get(3).map(|s| s.as_str()).unwrap_or("/ws");
+            print_cf_worker(origin, ws_path);
         }
         _ => {
-            eprintln!("Unknown mode. Use 'server' or client'");
+            help();
             std::process::exit(1);
         }
     }
-
     Ok(())
 }
