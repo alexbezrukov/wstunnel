@@ -19,9 +19,17 @@ const BUFFER_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT: usize = 10_000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
+const SOCKS_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V3_WS";
+
+// ── SOCKS5 constants ─────────────────────────────────────────────────────────
+const SOCKS5_VERSION: u8 = 0x05;
+const SOCKS5_CMD_CONNECT: u8 = 0x01;
+const SOCKS5_ATYP_IPV4: u8 = 0x01;
+const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
+const SOCKS5_ATYP_IPV6: u8 = 0x04;
 
 // ── Stats ────────────────────────────────────────────────────────────────────
 #[derive(Default)]
@@ -47,8 +55,6 @@ impl Stats {
 }
 
 // ── Cross-platform socket buffer tuning ──────────────────────────────────────
-// Uses cfg-guarded raw socket access — no unix-only traits in signature
-
 fn tune_tcp(stream: &TcpStream) {
     #[cfg(windows)]
     {
@@ -92,7 +98,173 @@ fn tune_listener(listener: &TcpListener) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  SERVER
+//  SOCKS5 SERVER  (runs on client side, Windows connects here)
+//
+//  Flow:
+//    Windows app → SOCKS5 handshake → us → parse target host:port
+//    → open WSS tunnel to VPS → VPS connects to target via its own SOCKS
+//    → bidirectional proxy
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Performs SOCKS5 handshake with local client (e.g. Windows system proxy).
+/// Returns the target address as "host:port" string that we forward through tunnel.
+async fn socks5_handshake(stream: &mut TcpStream) -> Result<String> {
+    // ── Greeting ─────────────────────────────────────────────────────────────
+    // Client sends: VER NMETHODS METHODS...
+    let mut header = [0u8; 2];
+    stream
+        .read_exact(&mut header)
+        .await
+        .context("SOCKS5: read greeting")?;
+
+    if header[0] != SOCKS5_VERSION {
+        anyhow::bail!("SOCKS5: bad version {}", header[0]);
+    }
+
+    let nmethods = header[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    stream
+        .read_exact(&mut methods)
+        .await
+        .context("SOCKS5: read methods")?;
+
+    // We always respond "no auth required" (0x00)
+    stream
+        .write_all(&[SOCKS5_VERSION, 0x00])
+        .await
+        .context("SOCKS5: write method")?;
+
+    // ── Request ───────────────────────────────────────────────────────────────
+    // Client sends: VER CMD RSV ATYP DST.ADDR DST.PORT
+    let mut req = [0u8; 4];
+    stream
+        .read_exact(&mut req)
+        .await
+        .context("SOCKS5: read request")?;
+
+    if req[0] != SOCKS5_VERSION {
+        anyhow::bail!("SOCKS5: bad version in request");
+    }
+    if req[1] != SOCKS5_CMD_CONNECT {
+        // Reply: command not supported
+        stream
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .ok();
+        anyhow::bail!("SOCKS5: unsupported command {}", req[1]);
+    }
+
+    // Parse address
+    let target_host = match req[3] {
+        SOCKS5_ATYP_IPV4 => {
+            let mut ip = [0u8; 4];
+            stream
+                .read_exact(&mut ip)
+                .await
+                .context("SOCKS5: read ipv4")?;
+            format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            let mut len = [0u8; 1];
+            stream
+                .read_exact(&mut len)
+                .await
+                .context("SOCKS5: read domain len")?;
+            let mut domain = vec![0u8; len[0] as usize];
+            stream
+                .read_exact(&mut domain)
+                .await
+                .context("SOCKS5: read domain")?;
+            String::from_utf8(domain).context("SOCKS5: domain not utf8")?
+        }
+        SOCKS5_ATYP_IPV6 => {
+            let mut ip = [0u8; 16];
+            stream
+                .read_exact(&mut ip)
+                .await
+                .context("SOCKS5: read ipv6")?;
+            let segments: Vec<String> = ip
+                .chunks(2)
+                .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+                .collect();
+            format!("[{}]", segments.join(":"))
+        }
+        t => anyhow::bail!("SOCKS5: unknown atyp {}", t),
+    };
+
+    let mut port_bytes = [0u8; 2];
+    stream
+        .read_exact(&mut port_bytes)
+        .await
+        .context("SOCKS5: read port")?;
+    let port = u16::from_be_bytes(port_bytes);
+
+    let target = format!("{}:{}", target_host, port);
+
+    // ── Reply: success ────────────────────────────────────────────────────────
+    // VER REP RSV ATYP BND.ADDR(4) BND.PORT(2)
+    stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .context("SOCKS5: write reply")?;
+
+    Ok(target)
+}
+
+/// SOCKS5 client handshake — used by server to connect upstream SOCKS5 to target.
+async fn socks5_connect(stream: &mut TcpStream, target: &str) -> Result<()> {
+    let (host, port_str) = target
+        .rsplit_once(':')
+        .context(format!("Invalid target: {}", target))?;
+    let port: u16 = port_str.parse().context("Invalid port")?;
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+
+    // Greeting: no-auth
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut resp = [0u8; 2];
+    stream.read_exact(&mut resp).await?;
+    if resp[1] != 0x00 {
+        anyhow::bail!("SOCKS5 upstream requires auth (method={})", resp[1]);
+    }
+
+    // CONNECT request with domain ATYP
+    let host_bytes = host.as_bytes();
+    let mut req = Vec::with_capacity(7 + host_bytes.len());
+    req.extend_from_slice(&[0x05, 0x01, 0x00, SOCKS5_ATYP_DOMAIN]);
+    req.push(host_bytes.len() as u8);
+    req.extend_from_slice(host_bytes);
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).await?;
+
+    // Read reply
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await?;
+    if reply[1] != 0x00 {
+        anyhow::bail!("SOCKS5 upstream CONNECT failed: code {}", reply[1]);
+    }
+    // Drain BND.ADDR + BND.PORT
+    match reply[3] {
+        SOCKS5_ATYP_IPV4 => {
+            let mut b = [0u8; 6];
+            stream.read_exact(&mut b).await?;
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            let mut l = [0u8; 1];
+            stream.read_exact(&mut l).await?;
+            let mut b = vec![0u8; l[0] as usize + 2];
+            stream.read_exact(&mut b).await?;
+        }
+        SOCKS5_ATYP_IPV6 => {
+            let mut b = [0u8; 18];
+            stream.read_exact(&mut b).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SERVER SIDE  (runs on VPS, connects to remote SOCKS5/direct)
 // ═════════════════════════════════════════════════════════════════════════════
 
 pub async fn run_server(
@@ -111,7 +283,6 @@ pub async fn run_server(
         .with_single_cert(certs, key)
         .context("Bad cert/key")?;
 
-    // Advertise h2 + http/1.1 — DPI sees normal HTTPS fingerprint
     tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     tls_cfg.max_fragment_size = Some(16384);
 
@@ -121,7 +292,7 @@ pub async fn run_server(
 
     println!("[SERVER] Listening on {}", bind_addr);
     println!("[SERVER] WebSocket path: {}", ws_path);
-    println!("[SERVER] Forwarding to SOCKS: {}", socks_addr);
+    println!("[SERVER] Upstream SOCKS: {}", socks_addr);
 
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let stats = Arc::new(Stats::default());
@@ -195,34 +366,36 @@ async fn handle_server_conn(
     let secret = secret_key.to_string();
     let auth_ok = Arc::new(Mutex::new(false));
     let auth_cb = auth_ok.clone();
+    let target_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let target_cb = target_cell.clone();
 
     let ws = timeout(
         HANDSHAKE_TIMEOUT,
         accept_hdr_async(tls, move |req: &Request, mut resp: Response| {
             if req.uri().path() != expected_path {
-                let mut err = http::Response::builder()
+                return Err(http::Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(None)
-                    .unwrap();
-                *err.headers_mut() = resp.headers().clone();
-                return Err(err);
+                    .unwrap());
             }
-            if let (Some(auth_hdr), Some(nonce_hdr)) =
-                (req.headers().get("x-auth"), req.headers().get("x-nonce"))
+            if let (Some(a), Some(n)) = (req.headers().get("x-auth"), req.headers().get("x-nonce"))
             {
-                let nonce = nonce_hdr.to_str().unwrap_or("");
-                if auth_hdr.to_str().unwrap_or("") == compute_token(&secret, nonce) {
+                let nonce = n.to_str().unwrap_or("");
+                if a.to_str().unwrap_or("") == compute_token(&secret, nonce) {
+                    // Capture target host:port from x-target header
+                    if let Some(t) = req.headers().get("x-target") {
+                        *target_cb.blocking_lock() = Some(t.to_str().unwrap_or("").to_string());
+                    }
                     *auth_cb.blocking_lock() = true;
                     resp.headers_mut()
                         .insert("server", HeaderValue::from_static("cloudflare"));
                     return Ok(resp);
                 }
             }
-            let err = http::Response::builder()
+            Err(http::Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .body(None)
-                .unwrap();
-            Err(err)
+                .unwrap())
         }),
     )
     .await
@@ -233,17 +406,33 @@ async fn handle_server_conn(
         return Err(anyhow::anyhow!("Auth failed from {}", peer));
     }
 
-    let socks = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(socks_addr))
+    let target = target_cell
+        .lock()
+        .await
+        .clone()
+        .context("Missing x-target header")?;
+
+    // Connect to upstream SOCKS5 on VPS, then CONNECT to target
+    let mut socks = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(socks_addr))
         .await
         .context("SOCKS connect timeout")??;
     let _ = socks.set_nodelay(true);
     tune_tcp(&socks);
 
+    timeout(SOCKS_TIMEOUT, socks5_connect(&mut socks, &target))
+        .await
+        .context("SOCKS5 upstream timeout")?
+        .context(format!("SOCKS5 upstream connect to {}", target))?;
+
     proxy_ws_tcp(ws, socks, stats).await
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  CLIENT
+//  CLIENT SIDE  (runs on Windows, acts as local SOCKS5 proxy)
+//
+//  Windows sets: socks=127.0.0.1:9050
+//  We accept SOCKS5, read target host:port, open WSS tunnel,
+//  forward the SOCKS5 CONNECT to VPS which connects to actual target.
 // ═════════════════════════════════════════════════════════════════════════════
 
 pub async fn run_client(
@@ -253,25 +442,43 @@ pub async fn run_client(
     skip_verify: bool,
     host_header: Option<&str>,
 ) -> Result<()> {
+    // Normalise URL
+    let server_url = {
+        let s = if server_url.starts_with("wss://") || server_url.starts_with("ws://") {
+            server_url.to_string()
+        } else {
+            format!("wss://{}", server_url)
+        };
+        // Append default path if none given (fewer than 3 slashes = no path)
+        if s.matches('/').count() < 3 {
+            format!("{}/ws", s)
+        } else {
+            s
+        }
+    };
+
     let listener = TcpListener::bind(bind_addr).await?;
     tune_listener(&listener);
 
-    println!("[CLIENT] Local SOCKS on {}", bind_addr);
-    println!("[CLIENT] Tunnel URL: {}", server_url);
+    println!("[CLIENT] SOCKS5 proxy listening on {}", bind_addr);
+    println!("[CLIENT] Tunnel server: {}", server_url);
     if let Some(h) = host_header {
-        println!("[CLIENT] CDN fronting host: {}", h);
+        println!("[CLIENT] CDN fronting: {}", h);
     }
     if skip_verify {
-        println!("[WARNING] Certificate verification DISABLED");
+        println!("[WARNING] TLS verification DISABLED");
     }
+    println!(
+        "[CLIENT] Set Windows proxy: socks=127.0.0.1:{}",
+        bind_addr.split(':').last().unwrap_or("9050")
+    );
 
     let tls_cfg = build_client_tls(skip_verify)?;
     let connector = Arc::new(tokio_tungstenite::Connector::Rustls(Arc::new(tls_cfg)));
-
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let stats = Arc::new(Stats::default());
     let secret = Arc::new(secret_key.to_string());
-    let url = Arc::new(server_url.to_string());
+    let url = Arc::new(server_url);
     let host_hdr = Arc::new(host_header.map(|h| h.to_string()));
 
     let s = stats.clone();
@@ -284,7 +491,7 @@ pub async fn run_client(
     });
 
     loop {
-        let (tcp, peer) = listener.accept().await?;
+        let (mut tcp, peer) = listener.accept().await?;
         let _ = tcp.set_nodelay(true);
         tune_tcp(&tcp);
 
@@ -304,7 +511,7 @@ pub async fn run_client(
             stats.total.fetch_add(1, Ordering::Relaxed);
 
             if let Err(e) = handle_client_conn(
-                tcp,
+                &mut tcp,
                 &url,
                 &secret,
                 host_hdr.as_deref(),
@@ -321,14 +528,21 @@ pub async fn run_client(
 }
 
 async fn handle_client_conn(
-    local: TcpStream,
+    local: &mut TcpStream,
     server_url: &str,
     secret_key: &str,
     host_override: Option<&str>,
     connector: Arc<tokio_tungstenite::Connector>,
     stats: Arc<Stats>,
 ) -> Result<()> {
-    // Per-connection random nonce → replay protection
+    // Step 1: SOCKS5 handshake with local Windows app
+    // Learn where it wants to connect
+    let target = timeout(SOCKS_TIMEOUT, socks5_handshake(local))
+        .await
+        .context("SOCKS5 handshake timeout")?
+        .context("SOCKS5 handshake failed")?;
+
+    // Step 2: Open WSS tunnel to VPS
     let nonce = {
         let mut b = [0u8; 16];
         use rand::RngCore;
@@ -339,17 +553,14 @@ async fn handle_client_conn(
 
     let mut builder = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(server_url)
-        // Browser-like headers — DPI treats this as normal HTTPS traffic
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        )
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")
         .header("x-auth", &token)
-        .header("x-nonce", &nonce);
+        .header("x-nonce", &nonce)
+        // Pass target host to server so it knows where to connect
+        .header("x-target", &target);
 
     if let Some(host) = host_override {
         builder = builder.header("Host", host);
@@ -364,23 +575,28 @@ async fn handle_client_conn(
     .await
     .context("WS connect timeout")??;
 
-    proxy_ws_tcp(ws, local, stats).await
+    // Step 3: Bidirectional proxy: local SOCKS5 app ↔ WSS tunnel ↔ VPS ↔ target
+    // At this point SOCKS5 handshake is done, local app sends raw data
+    // We need to split local into read/write without consuming it
+    proxy_ws_tcp_ref(ws, local, stats).await
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  BIDIRECTIONAL PROXY  WebSocket ↔ raw TCP
+//  BIDIRECTIONAL PROXY
 // ═════════════════════════════════════════════════════════════════════════════
 
-async fn proxy_ws_tcp<S>(
+/// Proxy between a WebSocket stream and a TCP stream (by reference — used on client side
+/// after SOCKS5 handshake already consumed part of the stream)
+async fn proxy_ws_tcp_ref<S>(
     ws: tokio_tungstenite::WebSocketStream<S>,
-    tcp: TcpStream,
+    tcp: &mut TcpStream,
     stats: Arc<Stats>,
 ) -> Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (mut tcp_rx, mut tcp_tx) = tokio::io::split(tcp);
+    let (mut tcp_rx, mut tcp_tx) = tcp.split();
 
     let stats_up = stats.clone();
     let tcp_to_ws = async move {
@@ -390,8 +606,11 @@ where
             match timeout(READ_TIMEOUT, tcp_rx.read(&mut buf)).await {
                 Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                 Ok(Ok(n)) => {
-                    let msg = Message::Binary(buf[..n].to_vec().into());
-                    if ws_tx.send(msg).await.is_err() {
+                    if ws_tx
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     total += n as u64;
@@ -414,7 +633,72 @@ where
                     }
                     total += data.len() as u64;
                 }
-                Ok(Some(Ok(Message::Ping(_)))) => {} // pong auto-handled by tungstenite
+                Ok(Some(Ok(Message::Ping(_)))) => {}
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
+                Ok(Some(Err(_))) => break,
+                _ => {}
+            }
+        }
+        let _ = tcp_tx.flush().await;
+        stats_down.bytes_rx.fetch_add(total, Ordering::Relaxed);
+        total
+    };
+
+    let (tx, rx) = tokio::join!(tcp_to_ws, ws_to_tcp);
+    if tx > 0 || rx > 0 {
+        println!("[CONN] Closed TX:{}KB RX:{}KB", tx / 1024, rx / 1024);
+    }
+    Ok(())
+}
+
+/// Server-side version: owns the TcpStream
+async fn proxy_ws_tcp<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    tcp: TcpStream,
+    stats: Arc<Stats>,
+) -> Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (mut tcp_rx, mut tcp_tx) = tokio::io::split(tcp);
+
+    let stats_up = stats.clone();
+    let tcp_to_ws = async move {
+        let mut buf = vec![0u8; BUFFER_SIZE];
+        let mut total = 0u64;
+        loop {
+            match timeout(READ_TIMEOUT, tcp_rx.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    if ws_tx
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    total += n as u64;
+                }
+            }
+        }
+        let _ = ws_tx.close().await;
+        stats_up.bytes_tx.fetch_add(total, Ordering::Relaxed);
+        total
+    };
+
+    let stats_down = stats;
+    let ws_to_tcp = async move {
+        let mut total = 0u64;
+        loop {
+            match timeout(READ_TIMEOUT, ws_rx.next()).await {
+                Ok(Some(Ok(Message::Binary(data)))) => {
+                    if tcp_tx.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    total += data.len() as u64;
+                }
+                Ok(Some(Ok(Message::Ping(_)))) => {}
                 Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
                 Ok(Some(Err(_))) => break,
                 _ => {}
@@ -440,30 +724,22 @@ fn print_cf_worker(origin: &str, ws_path: &str) {
     println!(
         r#"
 // Cloudflare Worker — paste into CF Dashboard → Workers & Pages → Create
-// Add env variable: ORIGIN_HOST = "{origin}"
-// Route:  *.yourdomain.com{ws_path}
-// Enable: CF Dashboard → Network → WebSockets → ON
+// Env variable: ORIGIN_HOST = "{origin}"
+// Route: *.yourdomain.com{ws_path}
+// Network → WebSockets → ON
 
 export default {{
   async fetch(request, env) {{
     const url = new URL(request.url);
     if (url.pathname !== "{ws_path}") {{
-      return new Response(
-        "<html><body><h1>404 Not Found</h1><hr><p>nginx/1.24.0</p></body></html>",
-        {{ status: 404, headers: {{ "Server": "nginx/1.24.0", "Content-Type": "text/html" }} }}
-      );
+      return new Response("<h1>404</h1>", {{ status: 404, headers: {{ "Server": "nginx/1.24.0" }} }});
     }}
-    const upgradeHeader = request.headers.get("Upgrade") || "";
-    if (upgradeHeader.toLowerCase() !== "websocket") {{
+    if ((request.headers.get("Upgrade")||"").toLowerCase() !== "websocket") {{
       return new Response("Expected WebSocket", {{ status: 426 }});
     }}
     const headers = new Headers(request.headers);
     headers.set("Host", env.ORIGIN_HOST.split(":")[0]);
-    return fetch(`wss://${{env.ORIGIN_HOST}}{ws_path}`, {{
-      method: request.method,
-      headers,
-      body: request.body,
-    }});
+    return fetch(`wss://${{env.ORIGIN_HOST}}{ws_path}`, {{ method: request.method, headers, body: request.body }});
   }},
 }};
 "#
@@ -510,10 +786,8 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     Ok(rustls_pemfile::private_key(&mut r)?.context("No private key found")?)
 }
 
-// ── NoCertVerifier (--insecure mode) ─────────────────────────────────────────
 #[derive(Debug)]
 struct NoCertVerifier;
-
 impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     fn verify_server_cert(
         &self,
@@ -557,36 +831,35 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    // Explicitly install ring as the rustls crypto provider.
-    // Required when multiple providers could be present in the dependency tree
-    // (e.g. tokio-tungstenite pulling aws-lc-rs on some platforms).
     rustls::crypto::ring::default_provider()
         .install_default()
-        .ok(); // ok() — ignore error if already installed (e.g. called twice)
+        .ok();
 
     let args: Vec<String> = std::env::args().collect();
 
     let help = |prog: &str| {
         eprintln!(
-            r#"TLS WebSocket Tunnel v3 (Windows + Linux, CDN-fronting ready)
+            r#"TLS WebSocket Tunnel v3
 
 USAGE:
   server  <bind> <socks> <cert.pem> <key.pem> <secret> [ws-path]
-  client  <bind> <wss-url> <secret> [--insecure] [--host <cdn-host>]
+  client  <bind> <server-url> <secret> [--insecure] [--host <cdn>]
   worker  <origin:port> [ws-path]
 
 EXAMPLES:
-  Server (VPS/Linux):
+
+  Server (Linux VPS, needs Dante/3proxy on 127.0.0.1:1080):
     {prog} server 0.0.0.0:443 127.0.0.1:1080 cert.pem key.pem MySecret /api/v1/ws
 
-  Client direct (Windows):
-    {prog} client 127.0.0.1:1080 wss://yourserver.com/api/v1/ws MySecret
+  Client (Windows — becomes local SOCKS5 server):
+    {prog} client 127.0.0.1:9050 wss://yourserver.com/api/v1/ws MySecret
+    Then set Windows proxy: socks=127.0.0.1:9050
 
-  Client via Cloudflare CDN (bypasses DC throttling):
-    {prog} client 127.0.0.1:1080 wss://tunnel.yourdomain.com/api/v1/ws MySecret
+  Client via Cloudflare CDN:
+    {prog} client 127.0.0.1:9050 wss://tunnel.yourdomain.com/api/v1/ws MySecret
 
-  Client self-signed (dev):
-    {prog} client 127.0.0.1:1080 wss://1.2.3.4:443/api/v1/ws MySecret --insecure
+  Client self-signed cert:
+    {prog} client 127.0.0.1:9050 wss://1.2.3.4:443/api/v1/ws MySecret --insecure
 
   Print Cloudflare Worker JS:
     {prog} worker 1.2.3.4:443 /api/v1/ws
