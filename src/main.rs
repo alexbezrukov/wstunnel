@@ -106,62 +106,62 @@ fn tune_listener(listener: &TcpListener) {
 //    → bidirectional proxy
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Performs SOCKS5 handshake with local client (e.g. Windows system proxy).
-/// Returns the target address as "host:port" string that we forward through tunnel.
-async fn socks5_handshake(stream: &mut TcpStream) -> Result<String> {
-    // ── Greeting ─────────────────────────────────────────────────────────────
-    // Client sends: VER NMETHODS METHODS...
-    let mut header = [0u8; 2];
+/// Auto-detect SOCKS5 or HTTP CONNECT, return "host:port".
+/// Windows system proxy sends SOCKS5 (VER=0x05) and HTTP CONNECT ("C" = 0x43).
+async fn proxy_handshake(stream: &mut TcpStream) -> Result<String> {
+    let mut first = [0u8; 1];
     stream
-        .read_exact(&mut header)
+        .read_exact(&mut first)
         .await
-        .context("SOCKS5: read greeting")?;
+        .context("handshake: read first byte")?;
 
-    if header[0] != SOCKS5_VERSION {
-        anyhow::bail!("SOCKS5: bad version {}", header[0]);
+    if first[0] == SOCKS5_VERSION {
+        // SOCKS5: first byte is version (0x05)
+        socks5_handshake_rest(stream).await
+    } else {
+        // HTTP CONNECT: first byte is 'C' of "CONNECT ..."
+        http_connect_handshake(stream, first[0]).await
     }
+}
 
-    let nmethods = header[1] as usize;
-    let mut methods = vec![0u8; nmethods];
+/// SOCKS5 handshake — first byte (VER=0x05) already read, passed in implicitly.
+async fn socks5_handshake_rest(stream: &mut TcpStream) -> Result<String> {
+    // NMETHODS byte
+    let mut nmethods_buf = [0u8; 1];
+    stream
+        .read_exact(&mut nmethods_buf)
+        .await
+        .context("SOCKS5: nmethods")?;
+    let mut methods = vec![0u8; nmethods_buf[0] as usize];
     stream
         .read_exact(&mut methods)
         .await
-        .context("SOCKS5: read methods")?;
+        .context("SOCKS5: methods")?;
 
-    // We always respond "no auth required" (0x00)
+    // No-auth response
     stream
         .write_all(&[SOCKS5_VERSION, 0x00])
         .await
-        .context("SOCKS5: write method")?;
+        .context("SOCKS5: method resp")?;
 
-    // ── Request ───────────────────────────────────────────────────────────────
-    // Client sends: VER CMD RSV ATYP DST.ADDR DST.PORT
+    // Request: VER CMD RSV ATYP
     let mut req = [0u8; 4];
     stream
         .read_exact(&mut req)
         .await
-        .context("SOCKS5: read request")?;
-
-    if req[0] != SOCKS5_VERSION {
-        anyhow::bail!("SOCKS5: bad version in request");
-    }
+        .context("SOCKS5: request")?;
     if req[1] != SOCKS5_CMD_CONNECT {
-        // Reply: command not supported
         stream
             .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await
             .ok();
-        anyhow::bail!("SOCKS5: unsupported command {}", req[1]);
+        anyhow::bail!("SOCKS5: unsupported cmd {}", req[1]);
     }
 
-    // Parse address
-    let target_host = match req[3] {
+    let host = match req[3] {
         SOCKS5_ATYP_IPV4 => {
             let mut ip = [0u8; 4];
-            stream
-                .read_exact(&mut ip)
-                .await
-                .context("SOCKS5: read ipv4")?;
+            stream.read_exact(&mut ip).await.context("SOCKS5: ipv4")?;
             format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
         }
         SOCKS5_ATYP_DOMAIN => {
@@ -169,46 +169,80 @@ async fn socks5_handshake(stream: &mut TcpStream) -> Result<String> {
             stream
                 .read_exact(&mut len)
                 .await
-                .context("SOCKS5: read domain len")?;
-            let mut domain = vec![0u8; len[0] as usize];
-            stream
-                .read_exact(&mut domain)
-                .await
-                .context("SOCKS5: read domain")?;
-            String::from_utf8(domain).context("SOCKS5: domain not utf8")?
+                .context("SOCKS5: domain len")?;
+            let mut d = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut d).await.context("SOCKS5: domain")?;
+            String::from_utf8(d).context("SOCKS5: domain utf8")?
         }
         SOCKS5_ATYP_IPV6 => {
             let mut ip = [0u8; 16];
-            stream
-                .read_exact(&mut ip)
-                .await
-                .context("SOCKS5: read ipv6")?;
-            let segments: Vec<String> = ip
+            stream.read_exact(&mut ip).await.context("SOCKS5: ipv6")?;
+            let segs: Vec<String> = ip
                 .chunks(2)
                 .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
                 .collect();
-            format!("[{}]", segments.join(":"))
+            format!("[{}]", segs.join(":"))
         }
         t => anyhow::bail!("SOCKS5: unknown atyp {}", t),
     };
 
-    let mut port_bytes = [0u8; 2];
-    stream
-        .read_exact(&mut port_bytes)
-        .await
-        .context("SOCKS5: read port")?;
-    let port = u16::from_be_bytes(port_bytes);
+    let mut pb = [0u8; 2];
+    stream.read_exact(&mut pb).await.context("SOCKS5: port")?;
+    let port = u16::from_be_bytes(pb);
 
-    let target = format!("{}:{}", target_host, port);
-
-    // ── Reply: success ────────────────────────────────────────────────────────
-    // VER REP RSV ATYP BND.ADDR(4) BND.PORT(2)
+    // Success reply
     stream
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await
-        .context("SOCKS5: write reply")?;
+        .context("SOCKS5: reply")?;
 
-    Ok(target)
+    Ok(format!("{}:{}", host, port))
+}
+
+/// HTTP CONNECT handshake — first byte already read, rest of request follows.
+async fn http_connect_handshake(stream: &mut TcpStream, first: u8) -> Result<String> {
+    // Read until \r\n\r\n
+    let mut buf = vec![first];
+    let mut tmp = [0u8; 1];
+    loop {
+        stream
+            .read_exact(&mut tmp)
+            .await
+            .context("HTTP CONNECT: read")?;
+        buf.push(tmp[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            anyhow::bail!("HTTP CONNECT: oversized request");
+        }
+    }
+
+    let head = std::str::from_utf8(&buf).context("HTTP CONNECT: non-utf8")?;
+    let first_line = head.lines().next().unwrap_or("");
+    // "CONNECT host:port HTTP/1.x"
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let authority = parts.next().unwrap_or("");
+
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        stream
+            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .ok();
+        anyhow::bail!("HTTP: unsupported method '{}'", method);
+    }
+    if !authority.contains(':') {
+        anyhow::bail!("HTTP CONNECT: no port in '{}'", authority);
+    }
+
+    // 200 Connection Established — browser/app then sends raw TLS/data
+    stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .context("HTTP CONNECT: write 200")?;
+
+    Ok(authority.to_string())
 }
 
 /// SOCKS5 client handshake — used by server to connect upstream SOCKS5 to target.
@@ -520,7 +554,7 @@ pub async fn run_client(
             )
             .await
             {
-                eprintln!("[CLIENT] {} — {}", peer, e);
+                eprintln!("[CLIENT] {} — {:#}", peer, e);
             }
             stats.active.fetch_sub(1, Ordering::Relaxed);
         });
@@ -536,11 +570,12 @@ async fn handle_client_conn(
     stats: Arc<Stats>,
 ) -> Result<()> {
     // Step 1: SOCKS5 handshake with local Windows app
-    // Learn where it wants to connect
-    let target = timeout(SOCKS_TIMEOUT, socks5_handshake(local))
+    let target = timeout(SOCKS_TIMEOUT, proxy_handshake(local))
         .await
         .context("SOCKS5 handshake timeout")?
         .context("SOCKS5 handshake failed")?;
+
+    eprintln!("[CLIENT] SOCKS5 → target: {}", target);
 
     // Step 2: Open WSS tunnel to VPS
     let nonce = {
