@@ -12,24 +12,24 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 
-# WebSocket (key change vs v2)
+# WebSocket — replaces raw TLS TCP from v2
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
-# TLS
-rustls = { version = "0.23", features = ["ring"] }
+# TLS — explicitly only ring, no aws-lc-rs to avoid provider ambiguity
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 
-# Crypto
+# Crypto / auth
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 
-# HTTP types (used by tungstenite)
+# HTTP types (re-exported by tungstenite)
 http = "1"
 
-# Sys / socket tuning
+# Socket tuning — "all" enables both Unix and Windows raw socket APIs
 socket2 = { version = "0.5", features = ["all"] }
 
 # Error handling
