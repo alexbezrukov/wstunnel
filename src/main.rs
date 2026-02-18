@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::{self, HeaderValue, StatusCode};
@@ -23,6 +23,40 @@ const SOCKS_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V3_WS";
+
+// ── Blacklist ────────────────────────────────────────────────────────────────
+static BLACKLIST: &[&str] = &[
+    "*.cursor.sh", // Block all cursor.sh subdomains
+    "telemetry.*", // Block all telemetry subdomains
+    "*.msn.com",
+    "mobile.events.data.microsoft.com",
+];
+
+/// Check if target matches any blacklist pattern.
+/// Supports wildcards: *.example.com, telemetry.*, exact matches
+fn is_blacklisted(target: &str) -> bool {
+    let host = target.split(':').next().unwrap_or(target).to_lowercase();
+
+    for pattern in BLACKLIST {
+        if pattern.starts_with("*.") {
+            // *.cursor.sh matches api3.cursor.sh, api2.cursor.sh
+            let suffix = &pattern[2..]; // remove "*."
+            if host.ends_with(suffix) || host == suffix {
+                return true;
+            }
+        } else if pattern.ends_with(".*") {
+            // telemetry.* matches telemetry.visualstudio.microsoft.com
+            let prefix = &pattern[..pattern.len() - 2]; // remove ".*"
+            if host.starts_with(prefix) {
+                return true;
+            }
+        } else if host == *pattern {
+            // Exact match
+            return true;
+        }
+    }
+    false
+}
 
 // ── SOCKS5 constants ─────────────────────────────────────────────────────────
 const SOCKS5_VERSION: u8 = 0x05;
@@ -201,22 +235,29 @@ async fn socks5_handshake_rest(stream: &mut TcpStream) -> Result<String> {
 
 /// HTTP CONNECT handshake — first byte already read, rest of request follows.
 async fn http_connect_handshake(stream: &mut TcpStream, first: u8) -> Result<String> {
-    // Read until \r\n\r\n
-    let mut buf = vec![first];
-    let mut tmp = [0u8; 1];
-    loop {
-        stream
-            .read_exact(&mut tmp)
-            .await
-            .context("HTTP CONNECT: read")?;
-        buf.push(tmp[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
+    // Read until \r\n\r\n with timeout on the whole operation
+    let read_headers = async {
+        let mut buf = vec![first];
+        let mut tmp = [0u8; 1];
+        loop {
+            stream
+                .read_exact(&mut tmp)
+                .await
+                .context("HTTP CONNECT: read")?;
+            buf.push(tmp[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > 8192 {
+                anyhow::bail!("HTTP CONNECT: oversized request");
+            }
         }
-        if buf.len() > 8192 {
-            anyhow::bail!("HTTP CONNECT: oversized request");
-        }
-    }
+        Ok::<_, anyhow::Error>(buf)
+    };
+
+    let buf = timeout(Duration::from_secs(10), read_headers)
+        .await
+        .context("HTTP CONNECT: timeout reading headers")??;
 
     let head = std::str::from_utf8(&buf).context("HTTP CONNECT: non-utf8")?;
     let first_line = head.lines().next().unwrap_or("");
@@ -308,19 +349,23 @@ pub async fn run_server(
     key_path: &str,
     secret_key: &str,
     ws_path: &str,
+    plain: bool, // Skip TLS if true
 ) -> Result<()> {
-    let certs = load_certs(cert_path)?;
-    let key = load_private_key(key_path)?;
+    let acceptor_opt = if plain {
+        println!("[SERVER] Plain WebSocket mode (no TLS)");
+        None
+    } else {
+        let certs = load_certs(cert_path)?;
+        let key = load_private_key(key_path)?;
+        let mut tls_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .context("Bad cert/key")?;
+        tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        tls_cfg.max_fragment_size = Some(16384);
+        Some(tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)))
+    };
 
-    let mut tls_cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("Bad cert/key")?;
-
-    tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    tls_cfg.max_fragment_size = Some(16384);
-
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg));
     let listener = TcpListener::bind(bind_addr).await?;
     tune_listener(&listener);
 
@@ -347,7 +392,7 @@ pub async fn run_server(
         let _ = tcp.set_nodelay(true);
         tune_tcp(&tcp);
 
-        let acceptor = acceptor.clone();
+        let acceptor_opt = acceptor_opt.clone();
         let socks = socks_addr.to_string();
         let sem = sem.clone();
         let stats = stats.clone();
@@ -362,9 +407,9 @@ pub async fn run_server(
             stats.active.fetch_add(1, Ordering::Relaxed);
             stats.total.fetch_add(1, Ordering::Relaxed);
 
-            if let Err(e) = handle_server_conn(
+            if let Err(e) = handle_server_conn_plain(
                 tcp,
-                acceptor,
+                acceptor_opt,
                 &socks,
                 &secret,
                 &ws_path,
@@ -381,6 +426,115 @@ pub async fn run_server(
             stats.active.fetch_sub(1, Ordering::Relaxed);
         });
     }
+}
+
+async fn handle_server_conn_plain(
+    tcp: TcpStream,
+    acceptor_opt: Option<tokio_rustls::TlsAcceptor>,
+    socks_addr: &str,
+    secret_key: &str,
+    ws_path: &str,
+    stats: Arc<Stats>,
+    peer: std::net::SocketAddr,
+) -> Result<()> {
+    if let Some(acceptor) = acceptor_opt {
+        // TLS mode
+        handle_server_conn(tcp, acceptor, socks_addr, secret_key, ws_path, stats, peer).await
+    } else {
+        // Plain WebSocket mode
+        handle_server_conn_notls(tcp, socks_addr, secret_key, ws_path, stats, peer).await
+    }
+}
+
+async fn handle_server_conn_notls(
+    tcp: TcpStream,
+    socks_addr: &str,
+    secret_key: &str,
+    ws_path: &str,
+    stats: Arc<Stats>,
+    peer: std::net::SocketAddr,
+) -> Result<()> {
+    let expected_path = ws_path.to_string();
+    let secret = secret_key.to_string();
+    let auth_ok = Arc::new(std::sync::Mutex::new(false));
+    let auth_cb = auth_ok.clone();
+    let target_cell: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let target_cb = target_cell.clone();
+
+    let ws = timeout(
+        HANDSHAKE_TIMEOUT,
+        accept_hdr_async(tcp, move |req: &Request, mut resp: Response| {
+            if req.uri().path() != expected_path {
+                let body = Some(
+                    "<html>\n<head><title>404 Not Found</title></head>\n\
+                                <body>\n<center><h1>404 Not Found</h1></center>\n\
+                                <hr><center>nginx/1.24.0</center>\n</body>\n</html>\n"
+                        .to_string(),
+                );
+                return Err(http::Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("Server", "nginx/1.24.0")
+                    .header("Content-Type", "text/html")
+                    .body(body)
+                    .unwrap());
+            }
+            if let (Some(a), Some(n)) = (req.headers().get("x-auth"), req.headers().get("x-nonce"))
+            {
+                let nonce = n.to_str().unwrap_or("");
+                if a.to_str().unwrap_or("") == compute_token(&secret, nonce) {
+                    if let Some(t) = req.headers().get("x-target") {
+                        if let Ok(mut g) = target_cb.lock() {
+                            *g = Some(t.to_str().unwrap_or("").to_string());
+                        }
+                    }
+                    if let Ok(mut g) = auth_cb.lock() {
+                        *g = true;
+                    }
+                    resp.headers_mut()
+                        .insert("server", HeaderValue::from_static("cloudflare"));
+                    return Ok(resp);
+                }
+            }
+            let body = Some(
+                "<html>\n<head><title>401 Authorization Required</title></head>\n\
+                            <body>\n<center><h1>401 Authorization Required</h1></center>\n\
+                            <hr><center>nginx/1.24.0</center>\n</body>\n</html>\n"
+                    .to_string(),
+            );
+            Err(http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("Server", "nginx/1.24.0")
+                .header("Content-Type", "text/html")
+                .body(body)
+                .unwrap())
+        }),
+    )
+    .await
+    .context("WS upgrade timeout")??;
+
+    if !*auth_ok.lock().unwrap_or_else(|e| e.into_inner()) {
+        stats.auth_failed.fetch_add(1, Ordering::Relaxed);
+        return Err(anyhow::anyhow!("Auth failed from {}", peer));
+    }
+
+    let target = target_cell
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .context("Missing x-target header")?;
+
+    let mut socks = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(socks_addr))
+        .await
+        .context("SOCKS connect timeout")??;
+    let _ = socks.set_nodelay(true);
+    tune_tcp(&socks);
+
+    timeout(SOCKS_TIMEOUT, socks5_connect(&mut socks, &target))
+        .await
+        .context("SOCKS5 upstream timeout")?
+        .context(format!("SOCKS5 upstream connect to {}", target))?;
+
+    proxy_ws_tcp(ws, socks, stats).await
 }
 
 async fn handle_server_conn(
@@ -408,10 +562,20 @@ async fn handle_server_conn(
         HANDSHAKE_TIMEOUT,
         accept_hdr_async(tls, move |req: &Request, mut resp: Response| {
             if req.uri().path() != expected_path {
-                return Err(http::Response::builder()
+                // Decoy: looks like nginx 404
+                let body = Some(
+                    "<html>\n<head><title>404 Not Found</title></head>\n\
+                                <body>\n<center><h1>404 Not Found</h1></center>\n\
+                                <hr><center>nginx/1.24.0</center>\n</body>\n</html>\n"
+                        .to_string(),
+                );
+                let mut err = http::Response::builder()
                     .status(StatusCode::NOT_FOUND)
-                    .body(None)
-                    .unwrap());
+                    .header("Server", "nginx/1.24.0")
+                    .header("Content-Type", "text/html")
+                    .body(body)
+                    .unwrap();
+                return Err(err);
             }
             if let (Some(a), Some(n)) = (req.headers().get("x-auth"), req.headers().get("x-nonce"))
             {
@@ -430,9 +594,18 @@ async fn handle_server_conn(
                     return Ok(resp);
                 }
             }
+            // Decoy: looks like nginx 401
+            let body = Some(
+                "<html>\n<head><title>401 Authorization Required</title></head>\n\
+                            <body>\n<center><h1>401 Authorization Required</h1></center>\n\
+                            <hr><center>nginx/1.24.0</center>\n</body>\n</html>\n"
+                    .to_string(),
+            );
             Err(http::Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
-                .body(None)
+                .header("Server", "nginx/1.24.0")
+                .header("Content-Type", "text/html")
+                .body(body)
                 .unwrap())
         }),
     )
@@ -580,6 +753,16 @@ async fn handle_client_conn(
         .context("SOCKS5 handshake failed")?;
 
     eprintln!("[CLIENT] SOCKS5 → target: {}", target);
+
+    // Check blacklist
+    if is_blacklisted(&target) {
+        eprintln!("[CLIENT] BLOCKED: {}", target);
+        // Send SOCKS5 error: connection refused
+        let _ = local
+            .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        anyhow::bail!("Target blacklisted");
+    }
 
     // Step 2: Open WSS tunnel to VPS
     let nonce = {
@@ -938,7 +1121,11 @@ EXAMPLES:
                 std::process::exit(1);
             }
             let ws_path = args.get(7).map(|s| s.as_str()).unwrap_or("/ws");
-            run_server(&args[2], &args[3], &args[4], &args[5], &args[6], ws_path).await?;
+            let plain = args.iter().any(|a| a == "--plain");
+            run_server(
+                &args[2], &args[3], &args[4], &args[5], &args[6], ws_path, plain,
+            )
+            .await?;
         }
         Some("client") => {
             if args.len() < 5 {
