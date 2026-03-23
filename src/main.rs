@@ -369,9 +369,10 @@ pub async fn run_server(
         let socks_bind = format!("0.0.0.0:{}", socks5_port);
         let socks_upstream = socks_addr.to_string();
         let users = Arc::new(users);
+        let acceptor = acceptor_opt.clone();
         println!("[SOCKS5] Plain SOCKS5 server on {}", socks_bind);
         tokio::spawn(async move {
-            if let Err(e) = run_socks5_server(&socks_bind, &socks_upstream, users).await {
+            if let Err(e) = run_socks5_server(&socks_bind, &socks_upstream, users, acceptor).await {
                 eprintln!("[SOCKS5] Error: {}", e);
             }
         });
@@ -421,27 +422,44 @@ async fn run_socks5_server(
     bind_addr: &str,
     upstream_socks: &str,
     users: Arc<Vec<(String, String)>>,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     tune_listener(&listener);
     loop {
-        let (mut tcp, peer) = listener.accept().await?;
+        let (tcp, peer) = listener.accept().await?;
         let _ = tcp.set_nodelay(true);
         let users = users.clone();
         let upstream = upstream_socks.to_string();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5_client(&mut tcp, &upstream, &users).await {
+            let result = async {
+                if let Some(acceptor) = acceptor {
+                    let mut tls = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
+                        .await
+                        .context("TLS timeout")??;
+                    handle_socks5_client(&mut tls, &upstream, &users).await
+                } else {
+                    let mut stream = tcp;
+                    handle_socks5_client(&mut stream, &upstream, &users).await
+                }
+            }
+            .await;
+            if let Err(e) = result {
                 eprintln!("[SOCKS5] {} — {}", peer, e);
             }
         });
     }
 }
 
-async fn handle_socks5_client(
-    stream: &mut TcpStream,
+async fn handle_socks5_client<S>(
+    stream: &mut S,
     upstream_socks: &str,
     users: &[(String, String)],
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
     // Greeting
     let mut ver = [0u8; 1];
     stream.read_exact(&mut ver).await?;
@@ -524,8 +542,8 @@ async fn handle_socks5_client(
         .await?;
 
     // Бидирекшнл копирование
-    let (mut sr, mut sw) = stream.split();
-    let (mut ur, mut uw) = upstream.split();
+    let (mut sr, mut sw) = tokio::io::split(stream);
+    let (mut ur, mut uw) = tokio::io::split(upstream);
     let t1 = tokio::io::copy(&mut sr, &mut uw);
     let t2 = tokio::io::copy(&mut ur, &mut sw);
     tokio::try_join!(t1, t2)?;
