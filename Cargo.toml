@@ -1,6 +1,6 @@
 [package]
-name = "tls_tunnel_v3"
-version = "0.3.0"
+name = "tunnel"
+version = "3.1.0"
 edition = "2021"
 
 [[bin]]
@@ -11,32 +11,36 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
-
-# WebSocket — replaces raw TLS TCP from v2
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
-# TLS — explicitly only ring, no aws-lc-rs to avoid provider ambiguity
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# TLS
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 
 # Crypto / auth
 sha2 = "0.10"
-rand = "0.8"
 base64 = "0.22"
-
-# HTTP types (re-exported by tungstenite)
-http = "1"
-
-# Socket tuning — "all" enables both Unix and Windows raw socket APIs
-socket2 = { version = "0.5", features = ["all"] }
+rand = "0.8"
 
 # Error handling
 anyhow = "1"
+
+# Socket tuning
+socket2 = { version = "0.5", features = ["all"] }
+
+# TUN mode: HTTP-клиент для загрузки tun2socks/wintun
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+
+# TUN mode: распаковка ZIP
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"
