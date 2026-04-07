@@ -1,13 +1,12 @@
-/// tunnel — unified WS/TLS proxy + DNS forwarder
+/// tunnel v4 — unified WS/TLS proxy + DNS forwarder
 ///
-/// SERVER: tunnel server <bind> <socks5-upstream> <cert.pem> <key.pem> <secret> [--path /ws] [--plain]
+/// SERVER: tunnel server <bind> <socks5-upstream> <cert.pem> <key.pem> <secret> [--path /ws] [--plain] [--dns 1.1.1.1:53]
 /// CLIENT: tunnel client <socks5-bind> <dns-bind> <wss://host/ws> <secret> [--insecure] [--host <cdn>]
 ///
 /// Windows DNS fix: set IPv4 DNS → 127.0.0.1, leave IPv6 DNS blank.
 /// Or bind dns to 0.0.0.0:53 so both 127.0.0.1 and ::1 queries hit it.
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use futures_util::future::Either;
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -20,13 +19,13 @@ use std::{
     },
     time::Duration,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::Semaphore,
     time::timeout,
 };
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{
     accept_hdr_async, connect_async_tls_with_config,
     tungstenite::{
@@ -36,8 +35,13 @@ use tokio_tungstenite::{
     },
 };
 
+trait IoStream: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> IoStream for T {}
+
+type DynStream = Box<dyn IoStream + Send + Unpin>;
+
 // ── Constants ────────────────────────────────────────────────────────────────
-const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V3_WS";
+const AUTH_MAGIC: &[u8] = b"TLS_TUNNEL_V4_WS";
 const BUF: usize = 128 * 1024;
 const MAX_CONN: usize = 10_000;
 const T_HS: Duration = Duration::from_secs(20);
@@ -45,7 +49,9 @@ const T_IO: Duration = Duration::from_secs(600);
 const T_SOCKS: Duration = Duration::from_secs(15);
 const T_DNS: Duration = Duration::from_secs(5);
 const DNS_BUF: usize = 4096;
-const UPSTREAM_DNS: &str = "1.1.1.1:53";
+const DEFAULT_UPSTREAM_DNS: &str = "1.1.1.1:53";
+/// Send WS ping every N seconds to keep NAT/CDN sessions alive
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 fn hmac_token(secret: &str, nonce: &str) -> String {
@@ -156,12 +162,9 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::ED25519,
-        ]
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -208,7 +211,6 @@ fn resp401() -> http::Response<Option<String>> {
 const S5: u8 = 0x05;
 
 async fn socks5_parse_target(s: &mut TcpStream) -> Result<String> {
-    // already consumed version byte — read nmethods
     let mut nm = [0u8; 1];
     s.read_exact(&mut nm).await?;
     let mut methods = vec![0u8; nm[0] as usize];
@@ -218,20 +220,25 @@ async fn socks5_parse_target(s: &mut TcpStream) -> Result<String> {
     let mut req = [0u8; 4];
     s.read_exact(&mut req).await?;
     if req[1] == 0x03 {
-        // UDP ASSOCIATE
-        s.write_all(&[S5, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        // UDP ASSOCIATE — tell client to send UDP to same address:0
+        // (we don't support UDP relay, just ack and let it time out)
+        s.write_all(&[S5, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await
             .ok();
         return Ok("__UDP__".into());
     }
-    anyhow::ensure!(req[1] == 0x01, "SOCKS5: only CONNECT");
+    anyhow::ensure!(
+        req[1] == 0x01,
+        "SOCKS5: only CONNECT supported (got {})",
+        req[1]
+    );
 
     let host = parse_addr_host(s, req[3]).await?;
     let mut pb = [0u8; 2];
     s.read_exact(&mut pb).await?;
     let port = u16::from_be_bytes(pb);
     s.write_all(&[S5, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?; // success
+        .await?;
     Ok(format!("{host}:{port}"))
 }
 
@@ -258,13 +265,13 @@ async fn parse_addr_host(s: &mut TcpStream, atyp: u8) -> Result<String> {
                 .collect();
             format!("[{}]", segs.join(":"))
         }
-        t => anyhow::bail!("unknown atyp {t}"),
+        t => anyhow::bail!("unknown SOCKS5 atyp {t}"),
     })
 }
 
-/// Connect to local SOCKS5 (for client→server relay), send CONNECT
+/// Connect to local SOCKS5 upstream, send CONNECT for target
 async fn socks5_connect_upstream(s: &mut TcpStream, target: &str) -> Result<()> {
-    let (host, port_s) = target.rsplit_once(':').context("bad target")?;
+    let (host, port_s) = target.rsplit_once(':').context("bad target addr")?;
     let port: u16 = port_s.parse()?;
     let host = host.trim_matches(|c| c == '[' || c == ']');
     let hb = host.as_bytes();
@@ -272,7 +279,10 @@ async fn socks5_connect_upstream(s: &mut TcpStream, target: &str) -> Result<()> 
     s.write_all(&[S5, 0x01, 0x00]).await?;
     let mut r = [0u8; 2];
     s.read_exact(&mut r).await?;
-    anyhow::ensure!(r[1] == 0x00, "upstream SOCKS5 needs auth");
+    anyhow::ensure!(
+        r[1] == 0x00,
+        "upstream SOCKS5 requires auth (not supported)"
+    );
 
     let mut req = Vec::with_capacity(7 + hb.len());
     req.extend_from_slice(&[S5, 0x01, 0x00, 0x03]);
@@ -283,8 +293,12 @@ async fn socks5_connect_upstream(s: &mut TcpStream, target: &str) -> Result<()> 
 
     let mut rep = [0u8; 4];
     s.read_exact(&mut rep).await?;
-    anyhow::ensure!(rep[1] == 0x00, "upstream SOCKS5 CONNECT failed: {}", rep[1]);
-    // consume BND
+    anyhow::ensure!(
+        rep[1] == 0x00,
+        "upstream SOCKS5 CONNECT failed: code {}",
+        rep[1]
+    );
+    // consume BND.ADDR
     match rep[3] {
         0x01 => {
             let mut b = [0u8; 6];
@@ -305,7 +319,7 @@ async fn socks5_connect_upstream(s: &mut TcpStream, target: &str) -> Result<()> 
     Ok(())
 }
 
-/// HTTP CONNECT (first byte already read)
+/// HTTP CONNECT (first byte already consumed)
 async fn http_connect_target(s: &mut TcpStream, first: u8) -> Result<String> {
     let mut buf = vec![first];
     let mut tmp = [0u8; 1];
@@ -315,21 +329,24 @@ async fn http_connect_target(s: &mut TcpStream, first: u8) -> Result<String> {
         if buf.ends_with(b"\r\n\r\n") {
             break;
         }
-        anyhow::ensure!(buf.len() <= 8192, "HTTP CONNECT: oversized");
+        anyhow::ensure!(buf.len() <= 8192, "HTTP CONNECT: request too large");
     }
     let head = std::str::from_utf8(&buf)?;
     let first_line = head.lines().next().unwrap_or("");
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let authority = parts.next().unwrap_or("");
-    anyhow::ensure!(method.eq_ignore_ascii_case("CONNECT"), "not CONNECT");
-    anyhow::ensure!(authority.contains(':'), "no port");
+    anyhow::ensure!(
+        method.eq_ignore_ascii_case("CONNECT"),
+        "not a CONNECT request"
+    );
+    anyhow::ensure!(authority.contains(':'), "CONNECT target missing port");
     s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
     Ok(authority.to_string())
 }
 
-/// Detect SOCKS5 vs HTTP-CONNECT
+/// Auto-detect SOCKS5 vs HTTP-CONNECT from first byte
 async fn proxy_handshake(s: &mut TcpStream) -> Result<String> {
     let mut b = [0u8; 1];
     s.read_exact(&mut b).await?;
@@ -341,36 +358,45 @@ async fn proxy_handshake(s: &mut TcpStream) -> Result<String> {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  BIDIRECTIONAL WS ↔ TCP
+//  BIDIRECTIONAL WS ↔ TCP  (single generic implementation)
 // ═════════════════════════════════════════════════════════════════════════════
 
-async fn relay<S>(
+/// Relay bytes between a WebSocket stream and a TCP stream.
+/// Sends WS pings every PING_INTERVAL to keep NAT/CDN sessions alive.
+async fn relay_ws_tcp<S>(
     ws: tokio_tungstenite::WebSocketStream<S>,
-    tcp: TcpStream,
+    mut tcp: TcpStream,
     stats: Arc<Stats>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut wt, mut wr) = ws.split();
-    let (mut tr, mut tw) = tokio::io::split(tcp);
+    let (mut tr, mut tw) = tcp.split();
 
     let st = stats.clone();
     let up = async move {
         let mut buf = vec![0u8; BUF];
         let mut n_total = 0u64;
+        let mut ping_tick = tokio::time::interval(PING_INTERVAL);
+        ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match timeout(T_IO, tr.read(&mut buf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                Ok(Ok(n)) => {
-                    if wt
-                        .send(Message::Binary(buf[..n].to_vec().into()))
-                        .await
-                        .is_err()
-                    {
+            tokio::select! {
+                res = timeout(T_IO, tr.read(&mut buf)) => {
+                    match res {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(n)) => {
+                            if wt.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                                break;
+                            }
+                            n_total += n as u64;
+                        }
+                    }
+                }
+                _ = ping_tick.tick() => {
+                    if wt.send(Message::Ping(vec![].into())).await.is_err() {
                         break;
                     }
-                    n_total += n as u64;
                 }
             }
         }
@@ -389,7 +415,9 @@ where
                     }
                     n_total += d.len() as u64;
                 }
+                // respond to pings from the other side
                 Ok(Some(Ok(Message::Ping(_)))) => {}
+                Ok(Some(Ok(Message::Pong(_)))) => {}
                 Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
                 Ok(Some(Err(_))) => break,
                 _ => {}
@@ -408,6 +436,61 @@ where
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  SERVER — WebSocket accept logic (shared between TLS and plain)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Perform WS handshake with auth check, returns (ws_stream, target)
+async fn ws_accept<IO>(
+    io: IO,
+    secret: &str,
+    path: &str,
+) -> Result<(tokio_tungstenite::WebSocketStream<IO>, String)>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let sec = secret.to_string();
+    let expected = path.to_string();
+    let auth = Arc::new(std::sync::Mutex::new(false));
+    let target = Arc::new(std::sync::Mutex::new(None::<String>));
+    let (a2, t2) = (auth.clone(), target.clone());
+
+    let ws = timeout(
+        T_HS,
+        accept_hdr_async(io, move |req: &Request, mut resp: Response| {
+            if req.uri().path() != expected {
+                return Err(resp404());
+            }
+            match (req.headers().get("x-auth"), req.headers().get("x-nonce")) {
+                (Some(a), Some(n))
+                    if a.to_str().unwrap_or("") == hmac_token(&sec, n.to_str().unwrap_or("")) =>
+                {
+                    if let Some(t) = req.headers().get("x-target") {
+                        *t2.lock().unwrap() = Some(t.to_str().unwrap_or("").to_string());
+                    }
+                    *a2.lock().unwrap() = true;
+                    resp.headers_mut()
+                        .insert("server", HeaderValue::from_static("nginx"));
+                    Ok(resp)
+                }
+                _ => Err(resp401()),
+            }
+        }),
+    )
+    .await
+    .context("WS handshake timeout")??;
+
+    if !*auth.lock().unwrap() {
+        anyhow::bail!("Auth failed");
+    }
+    let tgt = target
+        .lock()
+        .unwrap()
+        .clone()
+        .context("missing x-target header")?;
+    Ok((ws, tgt))
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  SERVER
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -419,15 +502,16 @@ pub async fn run_server(
     secret: &str,
     ws_path: &str,
     plain: bool,
+    upstream_dns: &str,
 ) -> Result<()> {
     let acceptor = if plain {
-        println!("[SERVER] plain WS (no TLS)");
+        println!("[SERVER] plain WS mode (no TLS)");
         None
     } else {
         let mut cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(load_certs(cert)?, load_key(key)?)
-            .context("bad cert/key")?;
+            .context("invalid cert/key")?;
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         cfg.max_fragment_size = Some(16384);
         Some(tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
@@ -435,13 +519,14 @@ pub async fn run_server(
 
     let listener = TcpListener::bind(bind).await?;
     tune(&listener);
-    println!("[SERVER] listen={bind} socks={socks} path={ws_path}");
+    println!("[SERVER] bind={bind} socks={socks} path={ws_path} dns_upstream={upstream_dns}");
 
     let sem = Arc::new(Semaphore::new(MAX_CONN));
     let stats = Arc::new(Stats::default());
     let secret = Arc::new(secret.to_string());
     let path = Arc::new(ws_path.to_string());
     let socks = Arc::new(socks.to_string());
+    let upstream_dns = Arc::new(upstream_dns.to_string());
     stats.spawn_reporter();
 
     loop {
@@ -449,13 +534,14 @@ pub async fn run_server(
         let _ = tcp.set_nodelay(true);
         tune(&tcp);
 
-        let (acceptor, socks, sem, stats, secret, path) = (
+        let (acceptor, socks, sem, stats, secret, path, upstream_dns) = (
             acceptor.clone(),
             socks.clone(),
             sem.clone(),
             stats.clone(),
             secret.clone(),
             path.clone(),
+            upstream_dns.clone(),
         );
 
         tokio::spawn(async move {
@@ -463,12 +549,21 @@ pub async fn run_server(
             stats.active.fetch_add(1, Ordering::Relaxed);
             stats.total.fetch_add(1, Ordering::Relaxed);
 
-            if let Err(e) =
-                server_conn(tcp, acceptor, &socks, &secret, &path, stats.clone(), peer).await
+            if let Err(e) = server_conn(
+                tcp,
+                acceptor,
+                &socks,
+                &secret,
+                &path,
+                &upstream_dns,
+                stats.clone(),
+                peer,
+            )
+            .await
             {
                 let m = e.to_string();
-                if !m.contains("401") && !m.contains("Auth") {
-                    eprintln!("[SERVER] {peer}: {e}");
+                if !m.contains("401") && !m.contains("Auth failed") {
+                    eprintln!("[SERVER] {peer}: {e:#}");
                 }
             }
             stats.active.fetch_sub(1, Ordering::Relaxed);
@@ -482,106 +577,43 @@ async fn server_conn(
     socks: &str,
     secret: &str,
     path: &str,
+    upstream_dns: &str,
     stats: Arc<Stats>,
-    peer: SocketAddr,
+    _peer: SocketAddr,
 ) -> Result<()> {
-    let (ws_either, target) = if let Some(acc) = acc {
+    // Унифицируем тип
+    let stream: DynStream = if let Some(acc) = acc {
         let tls = timeout(T_HS, acc.accept(tcp))
             .await
-            .context("TLS timeout")??;
-
-        let expected = path.to_string();
-        let sec = secret.to_string();
-        let auth = Arc::new(std::sync::Mutex::new(false));
-        let target = Arc::new(std::sync::Mutex::new(None::<String>));
-        let (a2, t2) = (auth.clone(), target.clone());
-
-        let ws = timeout(
-            T_HS,
-            accept_hdr_async(tls, move |req: &Request, mut resp: Response| {
-                if req.uri().path() != expected {
-                    return Err(resp404());
-                }
-                match (req.headers().get("x-auth"), req.headers().get("x-nonce")) {
-                    (Some(a), Some(n))
-                        if a.to_str().unwrap_or("")
-                            == hmac_token(&sec, n.to_str().unwrap_or("")) =>
-                    {
-                        if let Some(t) = req.headers().get("x-target") {
-                            *t2.lock().unwrap() = Some(t.to_str().unwrap_or("").to_string());
-                        }
-                        *a2.lock().unwrap() = true;
-                        resp.headers_mut()
-                            .insert("server", HeaderValue::from_static("nginx"));
-                        Ok(resp)
-                    }
-                    _ => Err(resp401()),
-                }
-            }),
-        )
-        .await
-        .context("WS timeout")??;
-
-        if !*auth.lock().unwrap() {
-            stats
-                .auth_failed
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            anyhow::bail!("Auth failed from {}", peer);
-        }
-        let tgt = target.lock().unwrap().clone().context("missing x-target")?;
-        (Either::Left(ws), tgt)
+            .context("TLS accept timeout")??;
+        Box::new(tls)
     } else {
-        let expected = path.to_string();
-        let sec = secret.to_string();
-        let auth = Arc::new(std::sync::Mutex::new(false));
-        let target = Arc::new(std::sync::Mutex::new(None::<String>));
-        let (a2, t2) = (auth.clone(), target.clone());
-
-        let ws = timeout(
-            T_HS,
-            accept_hdr_async(tcp, move |req: &Request, mut resp: Response| {
-                if req.uri().path() != expected {
-                    return Err(resp404());
-                }
-                match (req.headers().get("x-auth"), req.headers().get("x-nonce")) {
-                    (Some(a), Some(n))
-                        if a.to_str().unwrap_or("")
-                            == hmac_token(&sec, n.to_str().unwrap_or("")) =>
-                    {
-                        if let Some(t) = req.headers().get("x-target") {
-                            *t2.lock().unwrap() = Some(t.to_str().unwrap_or("").to_string());
-                        }
-                        *a2.lock().unwrap() = true;
-                        resp.headers_mut()
-                            .insert("server", HeaderValue::from_static("nginx"));
-                        Ok(resp)
-                    }
-                    _ => Err(resp401()),
-                }
-            }),
-        )
-        .await
-        .context("WS timeout")??;
-
-        if !*auth.lock().unwrap() {
-            stats
-                .auth_failed
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            anyhow::bail!("Auth failed from {}", peer);
-        }
-        let tgt = target.lock().unwrap().clone().context("missing x-target")?;
-        (Either::Right(ws), tgt)
+        Box::new(tcp)
     };
 
+    let (ws, tgt) = ws_accept(stream, secret, path).await.map_err(|e| {
+        stats.auth_failed.fetch_add(1, Ordering::Relaxed);
+        e
+    })?;
+
+    dispatch_ws(ws, tgt, socks.to_string(), upstream_dns.to_string(), stats).await
+}
+
+async fn dispatch_ws<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    target: String,
+    socks: String,
+    upstream_dns: String,
+    stats: Arc<Stats>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     if target == "__DNS__" {
-        match ws_either {
-            Either::Left(ws) => handle_dns_ws(ws, stats).await?,
-            Either::Right(ws) => handle_dns_ws(ws, stats).await?,
-        }
-        return Ok(());
+        return handle_dns_ws(ws, &upstream_dns, stats).await;
     }
 
-    let mut upstream = timeout(T_HS, TcpStream::connect(socks))
+    let mut upstream = timeout(T_HS, TcpStream::connect(&socks))
         .await
         .context("socks connect timeout")??;
     let _ = upstream.set_nodelay(true);
@@ -589,19 +621,17 @@ async fn server_conn(
 
     timeout(T_SOCKS, socks5_connect_upstream(&mut upstream, &target))
         .await
-        .context("socks timeout")?
-        .context(format!("socks connect to {}", target))?;
+        .context("socks negotiation timeout")?
+        .context(format!("socks CONNECT to {target}"))?;
 
-    match ws_either {
-        Either::Left(ws) => relay(ws, upstream, stats).await?,
-        Either::Right(ws) => relay(ws, upstream, stats).await?,
-    }
-
-    Ok(())
+    relay_ws_tcp(ws, upstream, stats).await
 }
+
+// ── DNS over WS (server side) ─────────────────────────────────────────────────
 
 async fn handle_dns_ws<S>(
     ws: tokio_tungstenite::WebSocketStream<S>,
+    upstream_dns: &str,
     stats: Arc<Stats>,
 ) -> Result<()>
 where
@@ -612,15 +642,16 @@ where
         match msg {
             Ok(Message::Binary(data)) => {
                 stats.dns_queries.fetch_add(1, Ordering::Relaxed);
-                let resp = match dns_upstream(&data).await {
+                let resp = match dns_upstream(&data, upstream_dns).await {
                     Ok(r) => r,
                     Err(e) => {
                         stats.dns_errors.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[DNS] upstream: {e}");
+                        eprintln!("[DNS] upstream error: {e}");
+                        // Return SERVFAIL (QR=1 AA=0 TC=0 RD=1 RA=1 RCODE=2)
                         let mut f = data.to_vec();
                         if f.len() >= 4 {
-                            f[2] = 0x81;
-                            f[3] = 0x82;
+                            f[2] = 0x81; // QR+RD
+                            f[3] = 0x82; // RA + SERVFAIL
                         }
                         f
                     }
@@ -628,6 +659,9 @@ where
                 if wt.send(Message::Binary(resp.into())).await.is_err() {
                     break;
                 }
+            }
+            Ok(Message::Ping(p)) => {
+                let _ = wt.send(Message::Pong(p)).await;
             }
             Ok(Message::Close(_)) | Err(_) => break,
             _ => {}
@@ -642,7 +676,7 @@ where
 
 pub async fn run_client(
     socks_bind: &str,
-    dns_bind: &str, // e.g. "0.0.0.0:53"  — bind both IPv4+IPv6 if 0.0.0.0
+    dns_bind: &str,
     server_url: &str,
     secret: &str,
     skip_verify: bool,
@@ -660,39 +694,38 @@ pub async fn run_client(
 
     stats.spawn_reporter();
 
-    // ── DNS UDP listener ──────────────────────────────────────────────────────
-    // Bind 0.0.0.0:53 to catch both 127.0.0.1 and ::1 queries from Windows.
-    // Windows sends to ::1 when IPv6 DNS is set, 127.0.0.1 for IPv4 DNS.
-    // With 0.0.0.0 we catch IPv4; for ::1 use [::]:53 separately or set
-    // only IPv4 DNS = 127.0.0.1 in ncpa.cpl (recommended, simplest fix).
+    // ── DNS UDP listeners (IPv4 + IPv6) ───────────────────────────────────────
     {
         let sock_v4 = Arc::new(UdpSocket::bind(dns_bind).await.context(format!(
-            "DNS bind {dns_bind} — run as admin/root or use port >1024"
+            "DNS bind {dns_bind} — run as Administrator/root, or use port >1024"
         ))?);
 
-        // Also try to bind IPv6 for ::1 support
         let ipv6_bind = dns_bind
             .replace("0.0.0.0", "[::]")
             .replace("127.0.0.1", "[::]");
         let sock_v6 = UdpSocket::bind(&ipv6_bind).await.ok().map(Arc::new);
 
-        println!("[DNS] listening on {dns_bind}");
+        println!("[DNS] IPv4 listener: {dns_bind}");
         if sock_v6.is_some() {
-            println!("[DNS] listening on {ipv6_bind}");
+            println!("[DNS] IPv6 listener: {ipv6_bind}");
         } else {
-            println!("[DNS] IPv6 bind {ipv6_bind} failed — set IPv4-only DNS in Windows");
+            println!(
+                "[DNS] IPv6 bind {ipv6_bind} failed — set IPv4-only DNS in Windows (recommended)"
+            );
         }
 
-        let (st, url2, sec2, con2) = (
-            stats.clone(),
-            url.clone(),
-            secret.clone(),
-            connector.clone(),
-        );
-        let sock4 = sock_v4.clone();
-        tokio::spawn(async move {
-            dns_loop(sock4, &url2, &sec2, con2, st).await;
-        });
+        {
+            let (st, url2, sec2, con2) = (
+                stats.clone(),
+                url.clone(),
+                secret.clone(),
+                connector.clone(),
+            );
+            let sock4 = sock_v4.clone();
+            tokio::spawn(async move {
+                dns_loop(sock4, &url2, &sec2, con2, st).await;
+            });
+        }
 
         if let Some(s6) = sock_v6 {
             let (st2, url3, sec3, con3) = (
@@ -710,18 +743,22 @@ pub async fn run_client(
     // ── SOCKS5 TCP listener ───────────────────────────────────────────────────
     let listener = TcpListener::bind(socks_bind).await?;
     tune(&listener);
-    println!("[CLIENT] SOCKS5 on {socks_bind}  server={url}");
+    println!("[CLIENT] SOCKS5 listener: {socks_bind}");
+    println!("[CLIENT] Tunnel server:   {url}");
     if skip_verify {
-        println!("[WARN] TLS verify disabled");
+        println!("[WARN]   TLS certificate verification DISABLED");
     }
+    println!();
+    println!("  Windows setup:");
     println!(
-        "[CLIENT] Windows proxy: Settings → Proxy → Manual → SOCKS 127.0.0.1:{}",
-        socks_bind.split(':').last().unwrap_or("9050")
+        "    1. Proxy:  Settings → Network → Proxy → Manual → SOCKS5 → {}",
+        socks_bind
     );
     println!(
-        "[CLIENT] Windows DNS:   ncpa.cpl → IPv4 → DNS = {}",
+        "    2. DNS:    ncpa.cpl → adapter → IPv4 → DNS = {}",
         dns_bind.split(':').next().unwrap_or("127.0.0.1")
     );
+    println!("       Leave IPv6 DNS blank.");
 
     loop {
         let (mut tcp, peer) = listener.accept().await?;
@@ -764,6 +801,7 @@ fn normalise_url(s: &str) -> String {
     } else {
         format!("wss://{s}")
     };
+    // Append /ws if no path given
     if s.matches('/').count() < 3 {
         format!("{s}/ws")
     } else {
@@ -771,7 +809,7 @@ fn normalise_url(s: &str) -> String {
     }
 }
 
-// ── DNS over WebSocket ────────────────────────────────────────────────────────
+// ── DNS over WebSocket (client side) ─────────────────────────────────────────
 
 async fn dns_loop(
     sock: Arc<UdpSocket>,
@@ -802,8 +840,8 @@ async fn dns_loop(
                 Ok(d) => d,
                 Err(e) => {
                     stats.dns_errors.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[DNS] {peer}: {e}");
-                    // return SERVFAIL
+                    eprintln!("[DNS] {peer}: {e:#}");
+                    // SERVFAIL
                     let mut f = query.clone();
                     if f.len() >= 4 {
                         f[2] = 0x81;
@@ -817,7 +855,10 @@ async fn dns_loop(
     }
 }
 
-/// Send DNS query over WebSocket tunnel, get response
+/// Forward a single DNS query through the WS tunnel, return the response.
+/// Opens a new WS connection per query — acceptable for DNS (low frequency,
+/// latency-tolerant). A persistent DNS WS session would require coordinating
+/// concurrent in-flight queries by transaction ID, adding complexity.
 async fn dns_forward(
     query: &[u8],
     url: &str,
@@ -838,26 +879,26 @@ async fn dns_forward(
         .header("Sec-WebSocket-Version", "13")
         .header("x-auth", &token)
         .header("x-nonce", &nonce)
-        .header("x-target", "__DNS__") // server recognises this special target
+        .header("x-target", "__DNS__")
         .body(())
-        .context("build dns ws req")?;
+        .context("build DNS WS request")?;
 
     let (ws, _) = timeout(
         T_HS,
         connect_async_tls_with_config(req, None, false, Some((*connector).clone())),
     )
     .await
-    .context("dns ws timeout")??;
+    .context("DNS WS connect timeout")??;
 
     let (mut tx, mut rx) = ws.split();
     tx.send(Message::Binary(query.to_vec().into())).await?;
 
     match timeout(T_DNS, rx.next())
         .await
-        .context("dns resp timeout")?
+        .context("DNS response timeout")?
     {
         Some(Ok(Message::Binary(d))) => Ok(d.to_vec()),
-        other => anyhow::bail!("unexpected dns ws msg: {:?}", other),
+        other => anyhow::bail!("unexpected DNS WS message: {:?}", other),
     }
 }
 
@@ -870,7 +911,7 @@ fn ws_host(url: &str) -> String {
         .to_string()
 }
 
-// ── SOCKS5 connection handler ─────────────────────────────────────────────────
+// ── SOCKS5/HTTP-CONNECT connection handler ────────────────────────────────────
 
 async fn client_conn(
     local: &mut TcpStream,
@@ -882,9 +923,11 @@ async fn client_conn(
 ) -> Result<()> {
     let target = timeout(T_SOCKS, proxy_handshake(local))
         .await
-        .context("handshake timeout")??;
+        .context("proxy handshake timeout")??;
 
     if target == "__UDP__" {
+        // UDP ASSOCIATE: we've already responded to the SOCKS client.
+        // The app will now send UDP directly (no actual relay needed here).
         return Ok(());
     }
     eprintln!("[TUNNEL] → {target}");
@@ -894,7 +937,7 @@ async fn client_conn(
     let wskey = rand_wskey();
     let host = ws_host(url);
 
-    let mut b = tokio_tungstenite::tungstenite::http::Request::builder()
+    let req = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(url)
         .header("Host", if let Some(h) = host_hdr { h } else { &host })
         .header("Upgrade", "websocket")
@@ -904,9 +947,9 @@ async fn client_conn(
         .header("User-Agent", "Mozilla/5.0")
         .header("x-auth", &token)
         .header("x-nonce", &nonce)
-        .header("x-target", &target);
-
-    let req = b.body(()).context("build ws req")?;
+        .header("x-target", &target)
+        .body(())
+        .context("build tunnel WS request")?;
 
     let (ws, _) = timeout(
         T_HS,
@@ -915,16 +958,18 @@ async fn client_conn(
     .await
     .context("WS connect timeout")??;
 
-    relay_ref(ws, local, stats).await
+    // relay_ws_tcp takes ownership; split local TCP manually
+    relay_ws_tcp_ref(ws, local, stats).await
 }
 
-async fn relay_ref<S>(
+/// Same as relay_ws_tcp but works with a &mut TcpStream (borrowed from caller)
+async fn relay_ws_tcp_ref<S>(
     ws: tokio_tungstenite::WebSocketStream<S>,
     tcp: &mut TcpStream,
     stats: Arc<Stats>,
 ) -> Result<()>
 where
-    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut wt, mut wr) = ws.split();
     let (mut tr, mut tw) = tcp.split();
@@ -933,18 +978,25 @@ where
     let up = async move {
         let mut buf = vec![0u8; BUF];
         let mut tot = 0u64;
+        let mut ping_tick = tokio::time::interval(PING_INTERVAL);
+        ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match timeout(T_IO, tr.read(&mut buf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                Ok(Ok(n)) => {
-                    if wt
-                        .send(Message::Binary(buf[..n].to_vec().into()))
-                        .await
-                        .is_err()
-                    {
+            tokio::select! {
+                res = timeout(T_IO, tr.read(&mut buf)) => {
+                    match res {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(n)) => {
+                            if wt.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                                break;
+                            }
+                            tot += n as u64;
+                        }
+                    }
+                }
+                _ = ping_tick.tick() => {
+                    if wt.send(Message::Ping(vec![].into())).await.is_err() {
                         break;
                     }
-                    tot += n as u64;
                 }
             }
         }
@@ -964,6 +1016,7 @@ where
                     tot += d.len() as u64;
                 }
                 Ok(Some(Ok(Message::Ping(_)))) => {}
+                Ok(Some(Ok(Message::Pong(_)))) => {}
                 Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => break,
                 Ok(Some(Err(_))) => break,
                 _ => {}
@@ -982,17 +1035,17 @@ where
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  SERVER DNS handler  (x-target == "__DNS__")
+//  DNS upstream (server side) — forward raw UDP to upstream resolver
 // ═════════════════════════════════════════════════════════════════════════════
 
-async fn dns_upstream(query: &[u8]) -> Result<Vec<u8>> {
+async fn dns_upstream(query: &[u8], upstream: &str) -> Result<Vec<u8>> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
-    sock.connect(UPSTREAM_DNS).await?;
+    sock.connect(upstream).await?;
     sock.send(query).await?;
     let mut buf = vec![0u8; DNS_BUF];
     let n = timeout(T_DNS, sock.recv(&mut buf))
         .await
-        .context("dns upstream timeout")??;
+        .context("DNS upstream timeout")??;
     buf.truncate(n);
     Ok(buf)
 }
@@ -1013,23 +1066,35 @@ async fn main() -> Result<()> {
     let help = || {
         eprintln!(
             r#"
-tunnel v3 — unified TCP+DNS WebSocket proxy
+tunnel v4 — TCP + DNS WebSocket proxy
 
 SERVER (VPS):
-  {prog} server <bind> <socks5-upstream> <cert.pem> <key.pem> <secret> [--path /ws] [--plain]
-  Example:
+  {prog} server <bind> <socks5-upstream> <cert.pem> <key.pem> <secret> \
+         [--path /ws] [--plain] [--dns 1.1.1.1:53]
+
+  Examples:
     {prog} server 0.0.0.0:443 127.0.0.1:1080 cert.pem key.pem MySecret
+    {prog} server 0.0.0.0:443 127.0.0.1:1080 cert.pem key.pem MySecret --dns 8.8.8.8:53
 
-CLIENT (Windows/local):
-  {prog} client <socks5-bind> <dns-bind> <wss://host/ws> <secret> [--insecure] [--host <cdn-host>]
-  Example:
+CLIENT (Windows / local):
+  {prog} client <socks5-bind> <dns-bind> <wss://host/ws> <secret> \
+         [--insecure] [--host <cdn-host>]
+
+  Examples:
     {prog} client 127.0.0.1:9050 0.0.0.0:53 wss://yourserver.com/ws MySecret
+    {prog} client 127.0.0.1:9050 0.0.0.0:53 wss://cdn.example.com/ws MySecret --host yourserver.com
 
-  Windows setup:
-    1. Set system proxy:  Settings → Network → Proxy → Manual → SOCKS5 127.0.0.1:9050
-    2. Set IPv4 DNS:      ncpa.cpl → adapter → IPv4 → DNS server = 127.0.0.1
-       Leave IPv6 DNS blank (or remove IPv6 entirely).
-    3. Run as Administrator (port 53 requires it).
+Windows setup (run tunnel.exe as Administrator):
+  1. SOCKS5 proxy:  Settings → Network → Proxy → Manual → SOCKS5 127.0.0.1:9050
+  2. DNS:           ncpa.cpl → adapter → IPv4 → DNS server = 127.0.0.1
+                    Leave IPv6 DNS BLANK (or disable IPv6).
+
+Notes:
+  --plain       Server: accept plain WS (no TLS), useful behind reverse proxy
+  --insecure    Client: skip TLS certificate verification (e.g. self-signed cert)
+  --host        Client: send different Host header (for CDN/SNI fronting)
+  --dns         Server: upstream DNS resolver (default: 1.1.1.1:53)
+  --path        Server: WebSocket path (default: /ws)
 "#
         );
     };
@@ -1046,8 +1111,13 @@ CLIENT (Windows/local):
                 .map(|w| w[1].as_str())
                 .unwrap_or("/ws");
             let plain = args.iter().any(|a| a == "--plain");
+            let dns = args
+                .windows(2)
+                .find(|w| w[0] == "--dns")
+                .map(|w| w[1].as_str())
+                .unwrap_or(DEFAULT_UPSTREAM_DNS);
             run_server(
-                &args[2], &args[3], &args[4], &args[5], &args[6], path, plain,
+                &args[2], &args[3], &args[4], &args[5], &args[6], path, plain, dns,
             )
             .await?;
         }
