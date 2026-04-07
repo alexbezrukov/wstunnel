@@ -1245,7 +1245,7 @@ EXAMPLES:
 
             let gateway = args
                 .windows(2)
-                .find(|w| w[0] == "--gateway")``
+                .find(|w| w[0] == "--gateway")
                 .map(|w| w[1].clone());
 
             let mut cfg = TunConfig::new(socks_addr, server_host);
